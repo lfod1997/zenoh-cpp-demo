@@ -1,0 +1,15 @@
+# General
+*.user
+build/
+out/
+
+# CMake
+cmake-build-*/
+CMakeUserPresets.json
+compile_commands.json
+
+# Editors
+.vs/
+.vscode/
+.idea/
+.idea_modules/
