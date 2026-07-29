@@ -148,7 +148,17 @@ int main(int argc, char *argv[]) {
 	}
 
 	// Initialize Zenoh and become a publisher
-	auto session = zenoh::Session::open(zenoh::Config::create_default());
+	zenoh::ZResult err;
+	string config_path{ "./config.json5" };
+	auto config = zenoh::Config::from_file(config_path, &err);
+	if (err == Z_OK) {
+		cout << "Loaded Zenoh config: " << config_path << '.' << endl;
+	}
+	else {
+		cout << "Unable to load " << config_path << " (" << static_cast<int>(err) << "); using default Zenoh config." << endl;
+		config = zenoh::Config::create_default();
+	}
+	auto session = zenoh::Session::open(move(config));
 	auto publisher = session.declare_publisher(key);
 	vector<zenoh::Subscriber<void>> subscribers{};
 
