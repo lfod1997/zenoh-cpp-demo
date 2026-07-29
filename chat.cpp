@@ -88,7 +88,7 @@ Command categorize_command(const string_view &line) {
 	return Command::INVALID;
 }
 
-optional<zenoh::Subscriber<void>> handle_command_sub(const string_view &line, const zenoh::Session &session, const string_view &current_pub_key = "") {
+optional<zenoh::Subscriber<void>> handle_command_sub(const string_view &line, const zenoh::Session &session, const string_view &current_pub_key, zenoh::ZResult *err = nullptr) {
 	if (line.size() <= 5) { return nullopt; }
 	const size_t begin = line.find_first_not_of(' ', 4);
 	if (begin == string_view::npos || begin == 4) { return nullopt; }
@@ -109,10 +109,11 @@ optional<zenoh::Subscriber<void>> handle_command_sub(const string_view &line, co
 #ifdef DEBUG
 		[key = string{ key }]() {
 			printf("- [%s]\n", key.c_str());
-		}
+		},
 #else
-		zenoh::closures::none
+		zenoh::closures::none,
 #endif
+		zenoh::Session::SubscriberOptions::create_default(), err
 	);
 
 #ifdef DEBUG
@@ -123,31 +124,29 @@ optional<zenoh::Subscriber<void>> handle_command_sub(const string_view &line, co
 }
 
 int main(int argc, char *argv[]) {
-	// Initialize program
-	{
-		enable_ansi_support();
-		current_input.reserve(1024);
-		ios_base::sync_with_stdio(true);
-	}
+	//region Initialize program
+	enable_ansi_support();
+	current_input.reserve(1024);
+	ios_base::sync_with_stdio(true);
+	//endregion
 
-	// Parse args
+	//region Parse args
 	string_view key;
-	{
-		for (size_t i = 1; i < argc; ++i) {
-			const string_view arg = argv[i];
-			if (arg == "-h" || arg == "--help") {
-				print_usage(argv[0]);
-				return 0;
-			}
-			else { key = arg; }
-		}
-		if (key.empty()) {
+	for (size_t i = 1; i < argc; ++i) {
+		const string_view arg = argv[i];
+		if (arg == "-h" || arg == "--help") {
 			print_usage(argv[0]);
 			return 0;
 		}
+		else { key = arg; }
 	}
+	if (key.empty()) {
+		print_usage(argv[0]);
+		return 0;
+	}
+	//endregion
 
-	// Initialize Zenoh and become a publisher
+	//region Initialize Zenoh
 	zenoh::ZResult err;
 	string config_path{ "./config.json5" };
 	auto config = zenoh::Config::from_file(config_path, &err);
@@ -158,8 +157,25 @@ int main(int argc, char *argv[]) {
 		cout << "Unable to load " << config_path << " (" << static_cast<int>(err) << "); using default Zenoh config." << endl;
 		config = zenoh::Config::create_default();
 	}
-	auto session = zenoh::Session::open(move(config));
-	auto publisher = session.declare_publisher(key);
+	auto session = zenoh::Session::open(
+		move(config),
+		zenoh::Session::SessionOptions::create_default(),
+		&err
+	);
+	if (err != Z_OK) {
+		cerr << "Failed to create Zenoh session." << endl;
+		return err;
+	}
+	//endregion
+
+	//region Become a publisher
+	auto publisher = session.declare_publisher(key, zenoh::Session::PublisherOptions::create_default(), &err);
+	if (err != Z_OK) {
+		cerr << "Failed to declare Zenoh publisher." << endl;
+		return err;
+	}
+	//endregion
+
 	vector<zenoh::Subscriber<void>> subscribers{};
 
 	// Main loop
@@ -173,51 +189,64 @@ int main(int argc, char *argv[]) {
 		while (true) {
 			cout << current_input_prompt << flush;
 
-			// Read line
-			int ch;
-			do {
-				ch = getkey();
-				lock_guard _{ current_input_mutex };
-				if (ch == 8 || ch == 127) { // Backspace key
-					if (!current_input.empty()) {
-						current_input.pop_back();
-						cout << ANSI_REMOVE_CHAR;
+			// Interactive CLI: basically just to read a line into `line`
+			{
+				int ch;
+				do {
+					ch = getkey();
+					lock_guard _{ current_input_mutex };
+					if (ch == 8 || ch == 127) { // Backspace key
+						if (!current_input.empty()) {
+							current_input.pop_back();
+							cout << ANSI_REMOVE_CHAR;
+						}
+					}
+					else if (ch == '\r' || ch == '\n') { // Enter key
+						line.swap(current_input);
+						cout << '\n';
+					}
+					else {
+						current_input.push_back(static_cast<char>(ch));
+						cout << static_cast<char>(ch);
+					}
+					cout << flush;
+				}
+				while (ch != '\r' && ch != '\n');
+			}
+
+			// If `line` begin with '/', handle as command; otherwise, publish as text
+			if (!line.empty()) {
+				if (line[0] != '/') {
+					publisher.put(line, zenoh::Publisher::PutOptions::create_default(), &err);
+					if (err != Z_OK) {
+						cerr << "Failed to publish text (" << static_cast<int>(err) << ")." << endl;
 					}
 				}
-				else if (ch == '\r' || ch == '\n') { // Enter key
-					line.swap(current_input);
-					cout << '\n';
-				}
-				else {
-					current_input.push_back(static_cast<char>(ch));
-					cout << static_cast<char>(ch);
-				}
-				cout << flush;
-			}
-			while (ch != '\r' && ch != '\n');
-
-			// If line begin with '/', handle as command; otherwise, publish the line
-			if (!line.empty()) {
-				if (line[0] != '/') { publisher.put(line); }
 				else {
 					switch (categorize_command(line)) {
 					case Command::ESCAPE: {
-						publisher.put(line.substr(1));
+						publisher.put(line.substr(1), zenoh::Publisher::PutOptions::create_default(), &err);
+						if (err != Z_OK) {
+							cerr << "Failed to publish text (" << static_cast<int>(err) << ")." << endl;
+						}
 						break;
 					}
 					case Command::QUIT: { goto epilogue; }
 					case Command::SUBSCRIBE: {
-						auto subscriber = handle_command_sub(line, session, key);
-						if (subscriber.has_value()) {
-							subscribers.push_back(move(subscriber).value());
+						auto subscriber = handle_command_sub(line, session, key, &err);
+						if (!subscriber.has_value()) {
+							cerr << "Unable to process command line \"" << line << "\": invalid syntax." << endl;
+						}
+						else if (err != Z_OK) { // When API fails, it's not OK to use the value
+							cerr << "Failed to subscribe (" << static_cast<int>(err) << ")." << endl;
 						}
 						else {
-							//TODO: Bad command
+							subscribers.push_back(move(subscriber).value());
 						}
 						break;
 					}
 					default: {
-						//TODO: Bad command
+						cerr << "Unable to process command line \"" << line << "\": unknown command." << endl;
 						break;
 					}
 					}
