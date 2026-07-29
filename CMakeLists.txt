@@ -53,12 +53,14 @@ endif ()
 
 project(LearnZenohCpp)
 
-add_executable(LearnZenohCpp main.cpp)
-target_link_libraries(LearnZenohCpp zenohc::lib zenohcxx::zenohc)
+add_executable(chat chat.cpp)
+target_link_libraries(chat zenohc::lib zenohcxx::zenohc)
+
+target_compile_definitions(chat PRIVATE $<$<CONFIG:Debug>:DEBUG>)
 
 if (BUILD_SHARED_LIBS)
     add_custom_command(
-        TARGET LearnZenohCpp
+        TARGET chat
         POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy ${dylib_full_path} ${CMAKE_BINARY_DIR}
         COMMENT "Copying shared library"

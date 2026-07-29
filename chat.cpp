@@ -1,0 +1,223 @@
+#include <cstdio>
+#include <iostream>
+#include <sstream>
+#include <vector>
+#include <string>
+#include <string_view>
+#include <optional>
+#include <mutex>
+#include <zenoh.hxx>
+
+//region Portable Raw Key Getter
+#if defined(_WIN32) || defined(_WIN64)
+#include <conio.h>
+#include <windows.h>
+
+namespace {
+void enable_ansi_support() {
+	HANDLE hOut = GetStdHandle(STD_OUTPUT_HANDLE);
+	if (hOut == INVALID_HANDLE_VALUE) return;
+	DWORD dwMode = 0;
+	if (!GetConsoleMode(hOut, &dwMode)) return;
+	dwMode |= ENABLE_VIRTUAL_TERMINAL_PROCESSING;
+	SetConsoleMode(hOut, dwMode);
+}
+
+int getkey() { return _getch(); }
+}
+#else
+#include <termios.h>
+#include <unistd.h>
+#include <cstdio>
+
+namespace {
+void enable_ansi_support() {}
+
+int getkey() {
+	struct termios t_old, t_new;
+	tcgetattr(STDIN_FILENO, &t_old);
+	t_new = t_old;
+	t_new.c_lflag &= ~(ICANON | ECHO);
+	tcsetattr(STDIN_FILENO, TCSANOW, &t_new);
+	int ch = getchar();
+	tcsetattr(STDIN_FILENO, TCSANOW, &t_old);
+	return ch;
+}
+}
+#endif
+//endregion
+
+using namespace std;
+
+// Globals
+namespace {
+/// ANSI sequence to clear current line and move caret to line start.
+constexpr char ANSI_CLEAR_LINE[] = "\r\x1b[2K";
+/// ANSI sequence to remove last character of current line and move caret one char backward.
+constexpr char ANSI_REMOVE_CHAR[] = "\b \b";
+
+string current_input{};
+string current_input_prompt{};
+mutex current_input_mutex{};
+}
+
+// Impl
+namespace {
+void print_usage(const char *progname) {
+	printf("Usage: %s KEY_EXPR [-h|--help]\n", progname);
+}
+
+enum class Command {
+	/// Invalid command.
+	INVALID = -1,
+	/// Escape sequence.
+	ESCAPE = 0,
+	/// Quit the program.
+	QUIT,
+	/// Subscribe to new channel.
+	SUBSCRIBE,
+};
+
+Command categorize_command(const string_view &line) {
+	// Begin with 2 slashes
+	if (line.size() >= 2 && line[1] == '/') { return Command::ESCAPE; }
+	// /quit
+	if (line.substr(1, 4) == "quit") { return Command::QUIT; }
+	// /sub key/expr/to/topic
+	if (line.substr(1, 3) == "sub") { return Command::SUBSCRIBE; }
+	return Command::INVALID;
+}
+
+optional<zenoh::Subscriber<void>> handle_command_sub(const string_view &line, const zenoh::Session &session, const string_view &current_pub_key = "") {
+	if (line.size() <= 5) { return nullopt; }
+	const size_t begin = line.find_first_not_of(' ', 4);
+	if (begin == string_view::npos || begin == 4) { return nullopt; }
+	const size_t end = line.find_first_of(' ', begin);
+	const string_view key = end == string_view::npos ? line.substr(begin) : line.substr(begin, end - begin);
+	if ((key[0] != '/' ? key : key.substr(1)) == current_pub_key) {
+		// Subscribing to the key we're publishing to
+	}
+
+	auto subscriber = session.declare_subscriber(
+		key,
+		[key = string{ key }](const zenoh::Sample &sample) {
+			lock_guard _{ current_input_mutex };
+			cout << ANSI_CLEAR_LINE;
+			cout << '[' << key << "] >> " << sample.get_payload().as_string() << '\n';
+			cout << current_input_prompt << current_input << flush;
+		},
+#ifdef DEBUG
+		[key = string{ key }]() {
+			printf("- [%s]\n", key.c_str());
+		}
+#else
+		zenoh::closures::none
+#endif
+	);
+
+#ifdef DEBUG
+	printf("+ [%s]\n", key.data());
+#endif
+	return subscriber;
+}
+}
+
+int main(int argc, char *argv[]) {
+	// Initialize program
+	{
+		enable_ansi_support();
+		current_input.reserve(1024);
+		ios_base::sync_with_stdio(true);
+	}
+
+	// Parse args
+	string_view key;
+	{
+		for (size_t i = 1; i < argc; ++i) {
+			const string_view arg = argv[i];
+			if (arg == "-h" || arg == "--help") {
+				print_usage(argv[0]);
+				return 0;
+			}
+			else { key = arg; }
+		}
+		if (key.empty()) {
+			print_usage(argv[0]);
+			return 0;
+		}
+	}
+
+	// Initialize Zenoh and become a publisher
+	auto session = zenoh::Session::open(zenoh::Config::create_default());
+	auto publisher = session.declare_publisher(key);
+	vector<zenoh::Subscriber<void>> subscribers{};
+
+	// Main loop
+	{
+		current_input_prompt = (
+			ostringstream{} << '[' << key << "] << "
+		).str();
+
+		string line{};
+		line.reserve(1024);
+		while (true) {
+			cout << current_input_prompt << flush;
+
+			// Read line
+			int ch;
+			do {
+				ch = getkey();
+				lock_guard _{ current_input_mutex };
+				if (ch == 8 || ch == 127) { // Backspace key
+					if (!current_input.empty()) {
+						current_input.pop_back();
+						cout << ANSI_REMOVE_CHAR;
+					}
+				}
+				else if (ch == '\r' || ch == '\n') { // Enter key
+					line.swap(current_input);
+					cout << '\n';
+				}
+				else {
+					current_input.push_back(static_cast<char>(ch));
+					cout << static_cast<char>(ch);
+				}
+				cout << flush;
+			}
+			while (ch != '\r' && ch != '\n');
+
+			// If line begin with '/', handle as command; otherwise, publish the line
+			if (!line.empty()) {
+				if (line[0] != '/') { publisher.put(line); }
+				else {
+					switch (categorize_command(line)) {
+					case Command::ESCAPE: {
+						publisher.put(line.substr(1));
+						break;
+					}
+					case Command::QUIT: { goto epilogue; }
+					case Command::SUBSCRIBE: {
+						auto subscriber = handle_command_sub(line, session, key);
+						if (subscriber.has_value()) {
+							subscribers.push_back(move(subscriber).value());
+						}
+						else {
+							//TODO: Bad command
+						}
+						break;
+					}
+					default: {
+						//TODO: Bad command
+						break;
+					}
+					}
+				}
+				line.clear();
+			}
+		}
+	}
+
+epilogue:
+	subscribers.clear();
+	return 0;
+}
