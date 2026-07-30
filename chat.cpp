@@ -37,7 +37,7 @@ int getkey() {
 	struct termios t_old, t_new;
 	tcgetattr(STDIN_FILENO, &t_old);
 	t_new = t_old;
-	t_new.c_lflag &= ~(ICANON | ECHO);
+	t_new.c_lflag &= ~(ICANON | ECHO | ISIG);
 	tcsetattr(STDIN_FILENO, TCSANOW, &t_new);
 	int ch = getchar();
 	tcsetattr(STDIN_FILENO, TCSANOW, &t_old);
@@ -225,6 +225,9 @@ int main(int argc, char *argv[]) {
 					else if (ch == '\x1b') { // Escape key
 						current_input.clear();
 						cout << ANSI_CLEAR_LINE << current_input_prompt;
+					}
+					else if (ch == '\x03' || ch == '\x1c') { // Keyboard interrupt (Ctrl+C or Ctrl+\)
+						goto epilogue;
 					}
 					else if (ch == '\r' || ch == '\n') { // Enter key
 						if (!current_input.empty()) {
