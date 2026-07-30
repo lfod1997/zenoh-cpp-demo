@@ -158,7 +158,7 @@ int main(int argc, char *argv[]) {
 		config = zenoh::Config::create_default();
 	}
 	auto session = zenoh::Session::open(
-		move(config),
+		std::move(config),
 		zenoh::Session::SessionOptions::create_default(),
 		&err
 	);
@@ -241,7 +241,7 @@ int main(int argc, char *argv[]) {
 							cerr << "Failed to subscribe (" << static_cast<int>(err) << ")." << endl;
 						}
 						else {
-							subscribers.push_back(move(subscriber).value());
+							subscribers.push_back(std::move(subscriber).value());
 						}
 						break;
 					}
