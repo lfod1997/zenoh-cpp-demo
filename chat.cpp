@@ -55,6 +55,28 @@ namespace {
 constexpr char ANSI_CLEAR_LINE[] = "\r\x1b[2K";
 /// ANSI sequence to remove last character of current line and move caret one char backward.
 constexpr char ANSI_REMOVE_CHAR[] = "\b \b";
+/// ANSI sequence to restore default console text style.
+constexpr char ANSI_STYLE_RESET[] = "\x1b[0m";
+
+[[maybe_unused]] constexpr char ANSI_STYLE_REGULAR_GRAY[] = "\x1b[0;90m";
+[[maybe_unused]] constexpr char ANSI_STYLE_REGULAR_RED[] = "\x1b[0;31m";
+[[maybe_unused]] constexpr char ANSI_STYLE_REGULAR_GREEN[] = "\x1b[0;32m";
+[[maybe_unused]] constexpr char ANSI_STYLE_REGULAR_YELLOW[] = "\x1b[0;33m";
+[[maybe_unused]] constexpr char ANSI_STYLE_REGULAR_BLUE[] = "\x1b[0;34m";
+[[maybe_unused]] constexpr char ANSI_STYLE_REGULAR_SKY[] = "\x1b[0;94m";
+[[maybe_unused]] constexpr char ANSI_STYLE_REGULAR_PURPLE[] = "\x1b[0;95m";
+[[maybe_unused]] constexpr char ANSI_STYLE_REGULAR_CYAN[] = "\x1b[0;96m";
+[[maybe_unused]] constexpr char ANSI_STYLE_REGULAR_WHITE[] = "\x1b[0;97m";
+[[maybe_unused]] constexpr char ANSI_STYLE_REGULAR_BG_BLACK[] = "\x1b[0;37;40m";
+[[maybe_unused]] constexpr char ANSI_STYLE_REGULAR_BG_GRAY[] = "\x1b[0;97;100m";
+[[maybe_unused]] constexpr char ANSI_STYLE_REGULAR_BG_RED[] = "\x1b[0;37;41m";
+[[maybe_unused]] constexpr char ANSI_STYLE_REGULAR_BG_GREEN[] = "\x1b[0;97;42m";
+[[maybe_unused]] constexpr char ANSI_STYLE_REGULAR_BG_YELLOW[] = "\x1b[0;97;43m";
+[[maybe_unused]] constexpr char ANSI_STYLE_REGULAR_BG_BLUE[] = "\x1b[0;37;44m";
+[[maybe_unused]] constexpr char ANSI_STYLE_REGULAR_BG_SKY[] = "\x1b[0;97;104m";
+[[maybe_unused]] constexpr char ANSI_STYLE_REGULAR_BG_PURPLE[] = "\x1b[0;97;105m";
+[[maybe_unused]] constexpr char ANSI_STYLE_REGULAR_BG_CYAN[] = "\x1b[0;90;106m";
+[[maybe_unused]] constexpr char ANSI_STYLE_REGULAR_BG_WHITE[] = "\x1b[0;30;47m";
 
 string current_input{};
 string current_input_prompt{};
@@ -64,7 +86,7 @@ mutex current_input_mutex{};
 // Impl
 namespace {
 void print_usage(const char *progname) {
-	printf("Usage: %s KEY_EXPR\n", progname);
+	cout << "Usage: " << progname << ' ' << ANSI_STYLE_REGULAR_WHITE << "KEY_EXPR" << ANSI_STYLE_RESET << endl;
 }
 
 enum class Command {
@@ -119,7 +141,7 @@ optional<vector<zenoh::Subscriber<void>>> handle_command_sub(const string_view &
 			[key = string{ key }](const zenoh::Sample &sample) {
 				lock_guard _{ current_input_mutex };
 				cout << ANSI_CLEAR_LINE;
-				cout << '[' << key << "] >> " << sample.get_payload().as_string() << '\n';
+				cout << ANSI_STYLE_REGULAR_BG_SKY << '[' << key << ']' << ANSI_STYLE_REGULAR_GRAY << " >> " << ANSI_STYLE_RESET << sample.get_payload().as_string() << '\n';
 				cout << current_input_prompt << current_input << flush;
 			},
 #ifdef DEBUG
@@ -172,10 +194,12 @@ int main(int argc, char *argv[]) {
 	string config_path{ "./config.json5" };
 	auto config = zenoh::Config::from_file(config_path, &err);
 	if (err == Z_OK) {
-		cout << "Loaded Zenoh config: " << config_path << '.' << endl;
+		cout << ANSI_STYLE_REGULAR_GRAY << "Loaded Zenoh config: " << config_path << '.' << ANSI_STYLE_RESET << endl;
 	}
 	else {
-		cout << "Unable to load " << config_path << " (" << static_cast<int>(err) << "); using default Zenoh config." << endl;
+		cout << ANSI_STYLE_REGULAR_YELLOW << "Unable to load " << config_path << " (" << static_cast<int>(err) << ").\n" << ANSI_STYLE_RESET;
+		cout << ANSI_STYLE_REGULAR_GRAY << "Using default Zenoh config.\n" << ANSI_STYLE_RESET;
+		cout << flush;
 		config = zenoh::Config::create_default();
 	}
 	auto session = zenoh::Session::open(
@@ -184,7 +208,7 @@ int main(int argc, char *argv[]) {
 		&err
 	);
 	if (err != Z_OK) {
-		cerr << "Failed to create Zenoh session." << endl;
+		cerr << ANSI_STYLE_REGULAR_RED << "Failed to create Zenoh session." << ANSI_STYLE_RESET << endl;
 		return err;
 	}
 	//endregion
@@ -192,7 +216,7 @@ int main(int argc, char *argv[]) {
 	//region Become a publisher
 	auto publisher = session.declare_publisher(key, zenoh::Session::PublisherOptions::create_default(), &err);
 	if (err != Z_OK) {
-		cerr << "Failed to declare Zenoh publisher." << endl;
+		cerr << ANSI_STYLE_REGULAR_RED << "Failed to declare Zenoh publisher." << ANSI_STYLE_RESET << endl;
 		return err;
 	}
 	//endregion
@@ -202,7 +226,7 @@ int main(int argc, char *argv[]) {
 	// Main loop
 	{
 		current_input_prompt = (
-			ostringstream{} << '[' << key << "] << "
+			ostringstream{} << ANSI_STYLE_REGULAR_BG_GRAY << '[' << key << ']' << ANSI_STYLE_REGULAR_GRAY << " << " << ANSI_STYLE_RESET
 		).str();
 
 		string line{};
@@ -251,7 +275,7 @@ int main(int argc, char *argv[]) {
 				if (line[0] != '/') {
 					publisher.put(line, zenoh::Publisher::PutOptions::create_default(), &err);
 					if (err != Z_OK) {
-						cerr << "Failed to publish text (" << static_cast<int>(err) << ")." << endl;
+						cerr << ANSI_STYLE_REGULAR_RED << "Failed to publish text (" << static_cast<int>(err) << ")." << ANSI_STYLE_RESET << endl;
 					}
 				}
 				else {
@@ -259,7 +283,7 @@ int main(int argc, char *argv[]) {
 					case Command::ESCAPE: {
 						publisher.put(line.substr(1), zenoh::Publisher::PutOptions::create_default(), &err);
 						if (err != Z_OK) {
-							cerr << "Failed to publish text (" << static_cast<int>(err) << ")." << endl;
+							cerr << ANSI_STYLE_REGULAR_RED << "Failed to publish text (" << static_cast<int>(err) << ")." << ANSI_STYLE_RESET << endl;
 						}
 						break;
 					}
@@ -267,10 +291,10 @@ int main(int argc, char *argv[]) {
 					case Command::SUBSCRIBE: {
 						auto result = handle_command_sub(line, session, &err);
 						if (!result.has_value()) {
-							cerr << "Unable to process command line \"" << line << "\": invalid syntax." << endl;
+							cerr << ANSI_STYLE_REGULAR_RED << "Unable to process command line \"" << line << "\": invalid syntax." << ANSI_STYLE_RESET << endl;
 						}
 						else if (err != Z_OK) { // When API fails, empty vector is returned
-							cerr << "Failed to subscribe (" << static_cast<int>(err) << ")." << endl;
+							cerr << ANSI_STYLE_REGULAR_RED << "Failed to subscribe (" << static_cast<int>(err) << ")." << ANSI_STYLE_RESET << endl;
 						}
 						else {
 							subscribers.reserve(subscribers.size() + result.value().size());
@@ -283,7 +307,7 @@ int main(int argc, char *argv[]) {
 						break;
 					}
 					default: {
-						cerr << "Unable to process command line \"" << line << "\": unknown command." << endl;
+						cerr << ANSI_STYLE_REGULAR_RED << "Unable to process command line \"" << line << "\": unknown command." << ANSI_STYLE_RESET << endl;
 						break;
 					}
 					}
