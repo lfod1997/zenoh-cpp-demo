@@ -1,8 +1,8 @@
 ## 构建过程
 
 1. 下载 [Ninja](https://github.com/ninja-build/ninja/releases/latest) 并放置在/添加到 Path，
-2. 安装 [Rust](https://rust-lang.org/zh-CN/tools/install/)，
-3. 打开一个新 Shell，更新 Rust：`rustup update`，
+2. [安装 Rust](https://rust-lang.org/zh-CN/tools/install/) 或更新至 1.75.0：`rustup update`，
+3. 打开一个新 Shell，
 4. 按以下参数进行 cmake 配置（可能需要在 IDE 的 CMake 设置中修改）：
    - `-G Ninja`：Ninja 生成器可提高混合语言工程的构建速度
    - `CMAKE_INSTALL_PREFIX`：无需设置，将固定为 cmake 构建目录的 `installed/`
