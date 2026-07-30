@@ -216,11 +216,15 @@ int main(int argc, char *argv[]) {
 				do {
 					ch = getkey();
 					lock_guard _{ current_input_mutex };
-					if (ch == 8 || ch == 127) { // Backspace key
+					if (ch == '\x08' || ch == '\x7f') { // Backspace key
 						if (!current_input.empty()) {
 							current_input.pop_back();
 							cout << ANSI_REMOVE_CHAR;
 						}
+					}
+					else if (ch == '\x1b') { // Escape key
+						current_input.clear();
+						cout << ANSI_CLEAR_LINE << current_input_prompt;
 					}
 					else if (ch == '\r' || ch == '\n') { // Enter key
 						line.swap(current_input);
