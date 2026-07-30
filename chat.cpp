@@ -64,7 +64,7 @@ mutex current_input_mutex{};
 // Impl
 namespace {
 void print_usage(const char *progname) {
-	printf("Usage: %s KEY_EXPR [-h|--help]\n", progname);
+	printf("Usage: %s KEY_EXPR\n", progname);
 }
 
 enum class Command {
@@ -88,38 +88,59 @@ Command categorize_command(const string_view &line) {
 	return Command::INVALID;
 }
 
-optional<zenoh::Subscriber<void>> handle_command_sub(const string_view &line, const zenoh::Session &session, const string_view &current_pub_key, zenoh::ZResult *err = nullptr) {
-	if (line.size() <= 5) { return nullopt; }
-	const size_t begin = line.find_first_not_of(' ', 4);
-	if (begin == string_view::npos || begin == 4) { return nullopt; }
-	const size_t end = line.find_first_of(' ', begin);
-	const string_view key = end == string_view::npos ? line.substr(begin) : line.substr(begin, end - begin);
-	if ((key[0] != '/' ? key : key.substr(1)) == current_pub_key) {
-		// Subscribing to the key we're publishing to
+optional<vector<zenoh::Subscriber<void>>> handle_command_sub(const string_view &line, const zenoh::Session &session, const string_view &current_pub_key, zenoh::ZResult *err = nullptr) {
+	if (line.back() == '/') { return nullopt; } // In no case might the last char be '/'
+
+	vector<string_view> keys{};
+
+	// A copy-less line parser (look what we have to do without C++20)
+	{
+		size_t end = 4;
+		while (end != string_view::npos) {
+			size_t begin = line.find_first_not_of(" \t", end);
+			if (begin == string_view::npos) { break; } // Done
+			if (begin == end || line[begin] == '/') { return nullopt; } // Invalid syntax: either command is /subXXX, or key starts with '/' (illegal)
+			end = begin; // `line[begin]` must be normal char here
+			do {
+				end = line.find_first_of("/ \t", end + 1);
+				if (end == string_view::npos) { break; } // Done
+				if (line[end - 1] == '/') { return nullopt; } // Invalid syntax: either key ends with '/' or contains "//" (both illegal)
+			}
+			while (line[end] == '/'); // Exit = found space or end of line
+			keys.push_back(line.substr(begin, end - begin));
+		}
 	}
 
-	auto subscriber = session.declare_subscriber(
-		key,
-		[key = string{ key }](const zenoh::Sample &sample) {
-			lock_guard _{ current_input_mutex };
-			cout << ANSI_CLEAR_LINE;
-			cout << '[' << key << "] >> " << sample.get_payload().as_string() << '\n';
-			cout << current_input_prompt << current_input << flush;
-		},
+	vector<zenoh::Subscriber<void>> subscribers{};
+	subscribers.reserve(keys.size());
+	for (const auto &key : keys) {
+		auto subscriber = session.declare_subscriber(
+			key,
+			[key = string{ key }](const zenoh::Sample &sample) {
+				lock_guard _{ current_input_mutex };
+				cout << ANSI_CLEAR_LINE;
+				cout << '[' << key << "] >> " << sample.get_payload().as_string() << '\n';
+				cout << current_input_prompt << current_input << flush;
+			},
 #ifdef DEBUG
-		[key = string{ key }]() {
-			printf("- [%s]\n", key.c_str());
-		},
+			[key = string{ key }]() { printf("- [%s]\n", key.c_str()); },
 #else
-		zenoh::closures::none,
+			zenoh::closures::none,
 #endif
-		zenoh::Session::SubscriberOptions::create_default(), err
-	);
-
+			zenoh::Session::SubscriberOptions::create_default(), err
+		);
+		if (*err != Z_OK) {
+			subscribers.clear();
+			return subscribers; // Return an empty vector to indicate API failure
+		}
+		else {
+			subscribers.push_back(std::move(subscriber));
 #ifdef DEBUG
-	printf("+ [%s]\n", key.data());
+			printf("+ [%s]\n", key.data());
 #endif
-	return subscriber;
+		}
+	}
+	return !subscribers.empty() ? optional{ std::move(subscribers) } : nullopt;
 }
 }
 
@@ -140,7 +161,7 @@ int main(int argc, char *argv[]) {
 		}
 		else { key = arg; }
 	}
-	if (key.empty()) {
+	if (key.empty() || key[0] == '/' || key.back() == '/' || key.find("//") != string_view::npos) {
 		print_usage(argv[0]);
 		return 0;
 	}
@@ -233,15 +254,20 @@ int main(int argc, char *argv[]) {
 					}
 					case Command::QUIT: { goto epilogue; }
 					case Command::SUBSCRIBE: {
-						auto subscriber = handle_command_sub(line, session, key, &err);
-						if (!subscriber.has_value()) {
+						auto result = handle_command_sub(line, session, key, &err);
+						if (!result.has_value()) {
 							cerr << "Unable to process command line \"" << line << "\": invalid syntax." << endl;
 						}
-						else if (err != Z_OK) { // When API fails, it's not OK to use the value
+						else if (err != Z_OK) { // When API fails, empty vector is returned
 							cerr << "Failed to subscribe (" << static_cast<int>(err) << ")." << endl;
 						}
 						else {
-							subscribers.push_back(std::move(subscriber).value());
+							subscribers.reserve(subscribers.size() + result.value().size());
+							subscribers.insert(
+								subscribers.end(),
+								make_move_iterator(result.value().begin()),
+								make_move_iterator(result.value().end())
+							);
 						}
 						break;
 					}
