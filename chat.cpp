@@ -227,8 +227,12 @@ int main(int argc, char *argv[]) {
 						cout << ANSI_CLEAR_LINE << current_input_prompt;
 					}
 					else if (ch == '\r' || ch == '\n') { // Enter key
-						line.swap(current_input);
-						cout << '\n';
+						if (!current_input.empty()) {
+							line.swap(current_input);
+							cout << '\n' << flush;
+							break;
+						}
+						else { continue; }
 					}
 					else {
 						current_input.push_back(static_cast<char>(ch));
@@ -236,7 +240,7 @@ int main(int argc, char *argv[]) {
 					}
 					cout << flush;
 				}
-				while (ch != '\r' && ch != '\n');
+				while (true);
 			}
 
 			// If `line` begin with '/', handle as command; otherwise, publish as text
