@@ -88,7 +88,7 @@ Command categorize_command(const string_view &line) {
 	return Command::INVALID;
 }
 
-optional<vector<zenoh::Subscriber<void>>> handle_command_sub(const string_view &line, const zenoh::Session &session, const string_view &current_pub_key, zenoh::ZResult *err = nullptr) {
+optional<vector<zenoh::Subscriber<void>>> handle_command_sub(const string_view &line, const zenoh::Session &session, zenoh::ZResult *err = nullptr) {
 	if (line.back() == '/') { return nullopt; } // In no case might the last char be '/'
 
 	vector<string_view> keys{};
@@ -265,7 +265,7 @@ int main(int argc, char *argv[]) {
 					}
 					case Command::QUIT: { goto epilogue; }
 					case Command::SUBSCRIBE: {
-						auto result = handle_command_sub(line, session, key, &err);
+						auto result = handle_command_sub(line, session, &err);
 						if (!result.has_value()) {
 							cerr << "Unable to process command line \"" << line << "\": invalid syntax." << endl;
 						}
