@@ -18,13 +18,13 @@ find_program(CARGO cargo REQUIRED)
 include(FetchContent)
 FetchContent_Declare(
     ZenohC
-    GIT_REPOSITORY git@github.com:eclipse-zenoh/zenoh-c.git
+    GIT_REPOSITORY https://github.com/eclipse-zenoh/zenoh-c.git
     GIT_TAG "1.9.0"
     GIT_SHALLOW TRUE
 )
 FetchContent_Declare(
     ZenohCpp
-    GIT_REPOSITORY git@github.com:eclipse-zenoh/zenoh-cpp.git
+    GIT_REPOSITORY https://github.com/eclipse-zenoh/zenoh-cpp.git
     GIT_TAG "1.9.0"
     GIT_SHALLOW TRUE
     GIT_SUBMODULES "" # The repo contains zenohc as a submodule (unused in cmake)
