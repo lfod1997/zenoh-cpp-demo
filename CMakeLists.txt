@@ -51,7 +51,7 @@ if (BUILD_SHARED_LIBS)
     install(FILES ${dylib_full_path} DESTINATION "${CMAKE_INSTALL_PREFIX}/bin")
 endif ()
 
-project(LearnZenohCpp)
+project(ZenohCppDemo)
 
 add_executable(chat chat.cpp)
 target_link_libraries(chat zenohc::lib zenohcxx::zenohc)
