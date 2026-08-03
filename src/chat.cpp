@@ -8,6 +8,9 @@
 #include <mutex>
 #include <zenoh.hxx>
 
+#include "schema/message.h"
+#include "ansi_sequences.h"
+
 //region Portable Raw Key Getter
 #if defined(_WIN32) || defined(_WIN64)
 #include <conio.h>
@@ -48,36 +51,10 @@ int getkey() {
 //endregion
 
 using namespace std;
+using namespace ZenohCppDemo::Schema;
 
 // Globals
 namespace {
-/// ANSI sequence to clear current line and move caret to line start.
-constexpr char ANSI_CLEAR_LINE[] = "\r\x1b[2K";
-/// ANSI sequence to remove last character of current line and move caret one char backward.
-constexpr char ANSI_REMOVE_CHAR[] = "\b \b";
-/// ANSI sequence to restore default console text style.
-constexpr char ANSI_STYLE_RESET[] = "\x1b[0m";
-
-[[maybe_unused]] constexpr char ANSI_STYLE_REGULAR_GRAY[] = "\x1b[0;90m";
-[[maybe_unused]] constexpr char ANSI_STYLE_REGULAR_RED[] = "\x1b[0;31m";
-[[maybe_unused]] constexpr char ANSI_STYLE_REGULAR_GREEN[] = "\x1b[0;32m";
-[[maybe_unused]] constexpr char ANSI_STYLE_REGULAR_YELLOW[] = "\x1b[0;33m";
-[[maybe_unused]] constexpr char ANSI_STYLE_REGULAR_BLUE[] = "\x1b[0;34m";
-[[maybe_unused]] constexpr char ANSI_STYLE_REGULAR_SKY[] = "\x1b[0;94m";
-[[maybe_unused]] constexpr char ANSI_STYLE_REGULAR_PURPLE[] = "\x1b[0;95m";
-[[maybe_unused]] constexpr char ANSI_STYLE_REGULAR_CYAN[] = "\x1b[0;96m";
-[[maybe_unused]] constexpr char ANSI_STYLE_REGULAR_WHITE[] = "\x1b[0;97m";
-[[maybe_unused]] constexpr char ANSI_STYLE_REGULAR_BG_BLACK[] = "\x1b[0;37;40m";
-[[maybe_unused]] constexpr char ANSI_STYLE_REGULAR_BG_GRAY[] = "\x1b[0;97;100m";
-[[maybe_unused]] constexpr char ANSI_STYLE_REGULAR_BG_RED[] = "\x1b[0;37;41m";
-[[maybe_unused]] constexpr char ANSI_STYLE_REGULAR_BG_GREEN[] = "\x1b[0;97;42m";
-[[maybe_unused]] constexpr char ANSI_STYLE_REGULAR_BG_YELLOW[] = "\x1b[0;97;43m";
-[[maybe_unused]] constexpr char ANSI_STYLE_REGULAR_BG_BLUE[] = "\x1b[0;37;44m";
-[[maybe_unused]] constexpr char ANSI_STYLE_REGULAR_BG_SKY[] = "\x1b[0;97;104m";
-[[maybe_unused]] constexpr char ANSI_STYLE_REGULAR_BG_PURPLE[] = "\x1b[0;97;105m";
-[[maybe_unused]] constexpr char ANSI_STYLE_REGULAR_BG_CYAN[] = "\x1b[0;90;106m";
-[[maybe_unused]] constexpr char ANSI_STYLE_REGULAR_BG_WHITE[] = "\x1b[0;30;47m";
-
 string current_input{};
 string current_input_prompt{};
 mutex current_input_mutex{};
@@ -110,6 +87,14 @@ Command categorize_command(const string_view &line) {
 	return Command::INVALID;
 }
 
+flatbuffers::DetachedBuffer build_message(const std::string_view &text, const char *mime_type = "text/plain") {
+	auto fbb = flatbuffers::FlatBufferBuilder{};
+	const auto mime_type_ser = fbb.CreateString(mime_type);
+	const auto content_ser = fbb.CreateVector(reinterpret_cast<const uint8_t*>(text.data()), text.size());
+	fbb.Finish(CreateChatMessage(fbb, mime_type_ser, content_ser));
+	return fbb.Release();
+}
+
 optional<vector<zenoh::Subscriber<void>>> handle_command_sub(const string_view &line, const zenoh::Session &session, zenoh::ZResult *err = nullptr) {
 	if (line.back() == '/') { return nullopt; } // In no case might the last char be '/'
 
@@ -139,9 +124,23 @@ optional<vector<zenoh::Subscriber<void>>> handle_command_sub(const string_view &
 		auto subscriber = session.declare_subscriber(
 			key,
 			[key = string{ key }](const zenoh::Sample &sample) {
+				//TODO: Make this zero-copy?
+				const auto buffer = sample.get_payload().as_vector();
+				if (flatbuffers::Verifier v{ buffer.data(), buffer.size() }; !VerifyChatMessageBuffer(v)) {
+					cerr << ANSI_STYLE_REGULAR_RED << "Corrupted payload received from " << key << "." << ANSI_STYLE_RESET << endl;
+					return;
+				}
+				const auto *message = GetChatMessage(buffer.data());
+				if (message->mime_type()->string_view().find("text/") == string_view::npos) {
+					cerr << ANSI_STYLE_REGULAR_RED << "Unsupported message type \"" << message->mime_type() << "\"." << ANSI_STYLE_RESET << endl;
+					return;
+				}
+				const auto *content = message->content();
+				const string_view content_as_str{ reinterpret_cast<const char*>(content->Data()), content->size() };
+
 				lock_guard _{ current_input_mutex };
 				cout << ANSI_CLEAR_LINE;
-				cout << ANSI_STYLE_REGULAR_BG_SKY << '[' << key << ']' << ANSI_STYLE_REGULAR_GRAY << " >> " << ANSI_STYLE_RESET << sample.get_payload().as_string() << '\n';
+				cout << ANSI_STYLE_REGULAR_BG_SKY << '[' << key << ']' << ANSI_STYLE_REGULAR_GRAY << " >> " << ANSI_STYLE_RESET << content_as_str << '\n';
 				cout << current_input_prompt << current_input << flush;
 			},
 #ifdef DEBUG
@@ -251,6 +250,7 @@ int main(int argc, char *argv[]) {
 						cout << ANSI_CLEAR_LINE << current_input_prompt;
 					}
 					else if (ch == '\x03' || ch == '\x1c') { // Keyboard interrupt (Ctrl+C or Ctrl+\)
+						cout << endl;
 						goto epilogue;
 					}
 					else if (ch == '\r' || ch == '\n') { // Enter key
@@ -273,7 +273,13 @@ int main(int argc, char *argv[]) {
 			// If `line` begin with '/', handle as command; otherwise, publish as text
 			if (!line.empty()) {
 				if (line[0] != '/') {
-					publisher.put(line, zenoh::Publisher::PutOptions::create_default(), &err);
+					flatbuffers::DetachedBuffer buffer = build_message(string_view{ line });
+					uint8_t *ptr = buffer.data(); //NOTE: Must store in variable to enforce execution order!
+					const size_t size = buffer.size(); //NOTE: Must store in variable to enforce execution order!
+					zenoh::Bytes payload{
+						ptr, size, [moved = std::move(buffer)](uint8_t *) {}
+					};
+					publisher.put(std::move(payload), zenoh::Publisher::PutOptions::create_default(), &err);
 					if (err != Z_OK) {
 						cerr << ANSI_STYLE_REGULAR_RED << "Failed to publish text (" << static_cast<int>(err) << ")." << ANSI_STYLE_RESET << endl;
 					}
@@ -281,7 +287,13 @@ int main(int argc, char *argv[]) {
 				else {
 					switch (categorize_command(line)) {
 					case Command::ESCAPE: {
-						publisher.put(line.substr(1), zenoh::Publisher::PutOptions::create_default(), &err);
+						flatbuffers::DetachedBuffer buffer = build_message(line.substr(1));
+						uint8_t *ptr = buffer.data(); //NOTE: Must store in variable to enforce execution order!
+						const size_t size = buffer.size(); //NOTE: Must store in variable to enforce execution order!
+						zenoh::Bytes payload{
+							ptr, size, [moved = std::move(buffer)](uint8_t *) {}
+						};
+						publisher.put(std::move(payload), zenoh::Publisher::PutOptions::create_default(), &err);
 						if (err != Z_OK) {
 							cerr << ANSI_STYLE_REGULAR_RED << "Failed to publish text (" << static_cast<int>(err) << ")." << ANSI_STYLE_RESET << endl;
 						}

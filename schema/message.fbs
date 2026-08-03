@@ -1,0 +1,8 @@
+namespace ZenohCppDemo.Schema;
+
+table ChatMessage {
+	mime_type: string (required);
+	content: [ubyte];
+}
+
+root_type ChatMessage;

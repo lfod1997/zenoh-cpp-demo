@@ -13,3 +13,8 @@ compile_commands.json
 .vscode/
 .idea/
 .idea_modules/
+
+# Generated Files
+*[._]gen.*
+*[._]generated.*
+**/generated/

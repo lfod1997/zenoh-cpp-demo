@@ -6,6 +6,8 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # Ensure tools
 find_program(CARGO cargo REQUIRED)
 execute_process(COMMAND ${CARGO} --version)
+find_program(FLATC flatc REQUIRED)
+execute_process(COMMAND ${FLATC} --version)
 
 # Set install path to somewhere non-system
 set(ideal_install_prefix "${CMAKE_BINARY_DIR}/installed")
@@ -30,9 +32,18 @@ FetchContent_Declare(
     GIT_SHALLOW TRUE
     GIT_SUBMODULES "" # The repo contains zenohc as a submodule (unused in cmake)
 )
+FetchContent_Declare(
+    FlatBuffers
+    GIT_REPOSITORY https://github.com/google/flatbuffers.git
+    GIT_TAG "v25.12.19-2026-02-06-03fffb2"
+    GIT_SHALLOW TRUE
+)
 
 # Fetch all dependencies
 FetchContent_MakeAvailable(ZenohC ZenohCpp)
+set(FLATBUFFERS_BUILD_TESTS FALSE CACHE INTERNAL "" FORCE)
+set(FLATBUFFERS_BUILD_FLATC FALSE CACHE INTERNAL "" FORCE)
+FetchContent_MakeAvailable(FlatBuffers)
 
 # Local install (adapted from zenohc's CMakeLists.txt)
 if (BUILD_SHARED_LIBS)
@@ -54,12 +65,37 @@ endif ()
 
 project(ZenohCppDemo)
 
-add_executable(chat chat.cpp)
-target_link_libraries(chat zenohc::lib zenohcxx::zenohc)
+# Declare a custom target that compiles all schemas
+set(schema_src_dir "${CMAKE_CURRENT_SOURCE_DIR}/schema")
+set(schema_gen_dir "${CMAKE_CURRENT_BINARY_DIR}/generated/schema")
+file(GLOB schema_src "${schema_src_dir}/*.fbs")
+set(schema_gen ${schema_src})
+list(TRANSFORM schema_gen REPLACE "\\.fbs$" ".gen.h")
+add_custom_command(
+    DEPENDS ${schema_src}
+    OUTPUT ${schema_gen}
+    COMMAND ${FLATC} --cpp --filename-suffix "" -I ${schema_src_dir} -o ${schema_gen_dir} ${schema_src}
+    WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+    COMMENT "Compiling schemas"
+    VERBATIM
+)
+add_custom_target(compile_schemas DEPENDS ${schema_gen})
 
+# Wrap generated headers to an interface library
+add_library(schemas INTERFACE)
+add_dependencies(schemas compile_schemas)
+target_include_directories(schemas INTERFACE "${CMAKE_CURRENT_BINARY_DIR}/generated")
+target_link_libraries(schemas INTERFACE flatbuffers)
+
+# Main executable
+add_executable(chat src/chat.cpp src/ansi_sequences.h)
+target_link_libraries(chat schemas zenohc::lib zenohcxx::zenohc)
+
+# Define the macro "DEBUG" if building with debug profile
 target_compile_definitions(chat PRIVATE $<$<CONFIG:Debug>:DEBUG>)
 
 if (BUILD_SHARED_LIBS)
+    # Copy shared libraries after building
     add_custom_command(
         TARGET chat
         POST_BUILD
