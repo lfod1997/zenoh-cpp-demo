@@ -87,11 +87,10 @@ Command categorize_command(const string_view &line) {
 	return Command::INVALID;
 }
 
-flatbuffers::DetachedBuffer build_message(const std::string_view &text, const char *mime_type = "text/plain") {
-	auto fbb = flatbuffers::FlatBufferBuilder{};
+flatbuffers::DetachedBuffer build_chat_message_metadata(const std::string_view &text, const char *mime_type = "text/plain") {
+	auto fbb = flatbuffers::FlatBufferBuilder{ 128 };
 	const auto mime_type_ser = fbb.CreateString(mime_type);
-	const auto content_ser = fbb.CreateVector(reinterpret_cast<const uint8_t*>(text.data()), text.size());
-	fbb.Finish(CreateChatMessage(fbb, mime_type_ser, content_ser));
+	fbb.Finish(CreateChatMessageMetadata(fbb, mime_type_ser, text.size()));
 	return fbb.Release();
 }
 
@@ -124,24 +123,54 @@ optional<vector<zenoh::Subscriber<void>>> handle_command_sub(const string_view &
 		auto subscriber = session.declare_subscriber(
 			key,
 			[key = string{ key }](const zenoh::Sample &sample) {
-				//TODO: Make this zero-copy?
-				const auto buffer = sample.get_payload().as_vector();
-				if (flatbuffers::Verifier v{ buffer.data(), buffer.size() }; !VerifyChatMessageBuffer(v)) {
-					cerr << ANSI_STYLE_REGULAR_RED << "Corrupted payload received from " << key << "." << ANSI_STYLE_RESET << endl;
+				auto attachment = sample.get_attachment();
+				if (!attachment.has_value()) {
 					return;
 				}
-				const auto *message = GetChatMessage(buffer.data());
-				if (message->mime_type()->string_view().find("text/") == string_view::npos) {
-					cerr << ANSI_STYLE_REGULAR_RED << "Unsupported message type \"" << message->mime_type() << "\"." << ANSI_STYLE_RESET << endl;
-					return;
-				}
-				const auto *content = message->content();
-				const string_view content_as_str{ reinterpret_cast<const char*>(content->Data()), content->size() };
 
-				lock_guard _{ current_input_mutex };
-				cout << ANSI_CLEAR_LINE;
-				cout << ANSI_STYLE_REGULAR_BG_SKY << '[' << key << ']' << ANSI_STYLE_REGULAR_GRAY << " >> " << ANSI_STYLE_RESET << content_as_str << '\n';
-				cout << current_input_prompt << current_input << flush;
+				// Read & verify the metadata itself
+				auto metadata_buffer = attachment->get().as_vector(); // Copied here; fine
+				if (flatbuffers::Verifier v{ metadata_buffer.data(), metadata_buffer.size() }; !VerifyChatMessageMetadataBuffer(v)) {
+					lock_guard _{ current_input_mutex };
+					cout << ANSI_CLEAR_LINE;
+					cerr << ANSI_STYLE_REGULAR_RED << "Corrupted payload received from " << key << ": bad metadata." << ANSI_STYLE_RESET << endl;
+					cout << current_input_prompt << current_input << flush;
+					return;
+				}
+
+				// Use the metadata to verify the payload
+				const auto *metadata = GetChatMessageMetadata(metadata_buffer.data());
+				const string_view mime_type = metadata->mime_type()->string_view();
+				if (mime_type.find("text/") == string_view::npos) {
+					lock_guard _{ current_input_mutex };
+					cout << ANSI_CLEAR_LINE;
+					cerr << ANSI_STYLE_REGULAR_RED << "Unsupported message type \"" << mime_type << "\"." << ANSI_STYLE_RESET << endl;
+					cout << current_input_prompt << current_input << flush;
+					return;
+				}
+				const auto &payload = sample.get_payload();
+				if (payload.size() != metadata->content_size()) {
+					lock_guard _{ current_input_mutex };
+					cout << ANSI_CLEAR_LINE;
+					cerr << ANSI_STYLE_REGULAR_RED << "Corrupted payload received from " << key << ": broken payload." << ANSI_STYLE_RESET << endl;
+					cout << current_input_prompt << current_input << flush;
+					return;
+				}
+
+				// Use payload in a zero-copy manner
+				{
+					lock_guard _{ current_input_mutex };
+					cout << ANSI_CLEAR_LINE;
+					cout << ANSI_STYLE_REGULAR_BG_SKY << '[' << key << ']' << ANSI_STYLE_REGULAR_GRAY << " >> " << ANSI_STYLE_RESET;
+					auto i = payload.slice_iter();
+					for (auto it = i.next(); it.has_value(); it = i.next()) {
+						const auto slice = it.value();
+						// According to the metadata, we are now sure the data is text, so `reinterpret_cast` is safe
+						cout << string_view{ reinterpret_cast<const char*>(slice.data), slice.len };
+					}
+					cout << '\n';
+					cout << current_input_prompt << current_input << flush;
+				}
 			},
 #ifdef DEBUG
 			[key = string{ key }]() { printf("- [%s]\n", key.c_str()); },
@@ -168,7 +197,7 @@ optional<vector<zenoh::Subscriber<void>>> handle_command_sub(const string_view &
 int main(int argc, char *argv[]) {
 	//region Initialize program
 	enable_ansi_support();
-	current_input.reserve(1024);
+	current_input.reserve(16384);
 	ios_base::sync_with_stdio(true);
 	//endregion
 
@@ -213,7 +242,12 @@ int main(int argc, char *argv[]) {
 	//endregion
 
 	//region Become a publisher
-	auto publisher = session.declare_publisher(key, zenoh::Session::PublisherOptions::create_default(), &err);
+	auto key_expr = session.declare_keyexpr(key, &err);
+	if (err != Z_OK) {
+		cerr << ANSI_STYLE_REGULAR_RED << "Failed to declare Zenoh key expression." << ANSI_STYLE_RESET << endl;
+		return err;
+	}
+	auto publisher = session.declare_publisher(key_expr, zenoh::Session::PublisherOptions::create_default(), &err);
 	if (err != Z_OK) {
 		cerr << ANSI_STYLE_REGULAR_RED << "Failed to declare Zenoh publisher." << ANSI_STYLE_RESET << endl;
 		return err;
@@ -229,7 +263,7 @@ int main(int argc, char *argv[]) {
 		).str();
 
 		string line{};
-		line.reserve(1024);
+		line.reserve(16384);
 		while (true) {
 			cout << current_input_prompt << flush;
 
@@ -273,13 +307,16 @@ int main(int argc, char *argv[]) {
 			// If `line` begin with '/', handle as command; otherwise, publish as text
 			if (!line.empty()) {
 				if (line[0] != '/') {
-					flatbuffers::DetachedBuffer buffer = build_message(string_view{ line });
-					uint8_t *ptr = buffer.data(); //NOTE: Must store in variable to enforce execution order!
-					const size_t size = buffer.size(); //NOTE: Must store in variable to enforce execution order!
-					zenoh::Bytes payload{
-						ptr, size, [moved = std::move(buffer)](uint8_t *) {}
+					const string_view content{ line };
+					flatbuffers::DetachedBuffer metadata_buffer = build_chat_message_metadata(content);
+					uint8_t *ptr = metadata_buffer.data(); //NOTE: Must store in variable to enforce execution order!
+					size_t size = metadata_buffer.size(); //NOTE: Must store in variable to enforce execution order!
+					auto put_opt = zenoh::Publisher::PutOptions::create_default();
+					put_opt.attachment = zenoh::Bytes{
+						ptr, size, [moved = std::move(metadata_buffer)](uint8_t *) {}
 					};
-					publisher.put(std::move(payload), zenoh::Publisher::PutOptions::create_default(), &err);
+					zenoh::Bytes payload{ content }; //NOTE: Copied here; impl zero copy for your specific need!
+					publisher.put(std::move(payload), std::move(put_opt), &err);
 					if (err != Z_OK) {
 						cerr << ANSI_STYLE_REGULAR_RED << "Failed to publish text (" << static_cast<int>(err) << ")." << ANSI_STYLE_RESET << endl;
 					}
@@ -287,13 +324,16 @@ int main(int argc, char *argv[]) {
 				else {
 					switch (categorize_command(line)) {
 					case Command::ESCAPE: {
-						flatbuffers::DetachedBuffer buffer = build_message(line.substr(1));
-						uint8_t *ptr = buffer.data(); //NOTE: Must store in variable to enforce execution order!
-						const size_t size = buffer.size(); //NOTE: Must store in variable to enforce execution order!
-						zenoh::Bytes payload{
-							ptr, size, [moved = std::move(buffer)](uint8_t *) {}
+						const string_view content = string_view{ line }.substr(1);
+						flatbuffers::DetachedBuffer metadata_buffer = build_chat_message_metadata(content);
+						uint8_t *ptr = metadata_buffer.data(); //NOTE: Must store in variable to enforce execution order!
+						size_t size = metadata_buffer.size(); //NOTE: Must store in variable to enforce execution order!
+						auto put_opt = zenoh::Publisher::PutOptions::create_default();
+						put_opt.attachment = zenoh::Bytes{
+							ptr, size, [moved = std::move(metadata_buffer)](uint8_t *) {}
 						};
-						publisher.put(std::move(payload), zenoh::Publisher::PutOptions::create_default(), &err);
+						zenoh::Bytes payload{ content }; //NOTE: Copied here; impl zero copy for your specific need!
+						publisher.put(std::move(payload), std::move(put_opt), &err);
 						if (err != Z_OK) {
 							cerr << ANSI_STYLE_REGULAR_RED << "Failed to publish text (" << static_cast<int>(err) << ")." << ANSI_STYLE_RESET << endl;
 						}
