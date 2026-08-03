@@ -247,7 +247,9 @@ int main(int argc, char *argv[]) {
 		cerr << ANSI_STYLE_REGULAR_RED << "Failed to declare Zenoh key expression." << ANSI_STYLE_RESET << endl;
 		return err;
 	}
-	auto publisher = session.declare_publisher(key_expr, zenoh::Session::PublisherOptions::create_default(), &err);
+	auto pub_opt = zenoh::Session::PublisherOptions::create_default();
+	pub_opt.congestion_control = Z_CONGESTION_CONTROL_BLOCK; //NOTE: Congestion control must be set
+	auto publisher = session.declare_publisher(key_expr, std::move(pub_opt), &err);
 	if (err != Z_OK) {
 		cerr << ANSI_STYLE_REGULAR_RED << "Failed to declare Zenoh publisher." << ANSI_STYLE_RESET << endl;
 		return err;
