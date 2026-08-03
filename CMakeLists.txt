@@ -3,6 +3,10 @@ cmake_minimum_required(VERSION 3.25)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+# Ensure tools
+find_program(CARGO cargo REQUIRED)
+execute_process(COMMAND ${CARGO} --version)
+
 # Set install path to somewhere non-system
 set(ideal_install_prefix "${CMAKE_BINARY_DIR}/installed")
 if (NOT CMAKE_INSTALL_PREFIX_INITIALIZED_TO_DEFAULT AND CMAKE_INSTALL_PREFIX AND NOT CMAKE_INSTALL_PREFIX STREQUAL ideal_install_prefix)
@@ -10,9 +14,6 @@ if (NOT CMAKE_INSTALL_PREFIX_INITIALIZED_TO_DEFAULT AND CMAKE_INSTALL_PREFIX AND
 endif ()
 set(CMAKE_INSTALL_PREFIX ${ideal_install_prefix} CACHE PATH "Fixed install path." FORCE)
 message(STATUS "CMAKE_INSTALL_PREFIX = ${CMAKE_INSTALL_PREFIX}")
-
-# Ensure Rust tools are installed
-find_program(CARGO cargo REQUIRED)
 
 # Dependencies
 include(FetchContent)
