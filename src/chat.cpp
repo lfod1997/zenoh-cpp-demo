@@ -1,6 +1,12 @@
+#if defined(_WIN32) || defined(_WIN64)
+#define _CRT_SECURE_NO_WARNINGS
+#endif
+
 #include <cstdio>
+#include <cstdlib>
 #include <iostream>
 #include <sstream>
+#include <fstream>
 #include <vector>
 #include <string>
 #include <string_view>
@@ -9,16 +15,24 @@
 #include <mutex>
 #include <algorithm>
 #include <type_traits>
+#include <filesystem>
+#include <system_error>
 
 #include <zenoh.hxx>
+#include <mio/mmap.hpp>
 
 #include "schema/message.h"
 #include "ansi_sequences.h"
 
+#if defined(_WIN32) || defined(_WIN64)
+#include <windows.h>
+#else
+#include <unistd.h>
+#endif
+
 //region Portable Raw Key Getter
 #if defined(_WIN32) || defined(_WIN64)
 #include <conio.h>
-#include <windows.h>
 
 namespace {
 void enable_ansi_support() {
@@ -34,8 +48,6 @@ int getkey() { return _getch(); }
 }
 #else
 #include <termios.h>
-#include <unistd.h>
-#include <cstdio>
 
 namespace {
 void enable_ansi_support() {}
@@ -49,6 +61,52 @@ int getkey() {
 	int ch = getchar();
 	tcsetattr(STDIN_FILENO, TCSANOW, &t_old);
 	return ch;
+}
+}
+#endif
+//endregion
+
+//region Portable Default Save Dir Getter
+#if defined(_WIN32) || defined(_WIN64)
+    #include <ShlObj.h>
+
+namespace {
+std::filesystem::path get_default_save_dir() {
+	PWSTR wpath = nullptr;
+	if (SHGetKnownFolderPath(FOLDERID_Downloads, KF_FLAG_DEFAULT, nullptr, &wpath) == S_OK) {
+		std::filesystem::path dd{ wpath };
+		CoTaskMemFree(wpath);
+		return dd;
+	}
+
+	// Fallbacks
+	if (const char *home_env = std::getenv("USERPROFILE")) {
+		std::filesystem::path base{ home_env };
+		if (std::filesystem::path dd = base / "Downloads"; is_directory(status(dd))) { return dd; }
+		return base;
+	}
+	if (const char *hd = std::getenv("HOMEDRIVE")) {
+		if (const char *hp = std::getenv("HOMEPATH")) {
+			std::filesystem::path base = std::filesystem::path{ hd } / hp;
+			if (std::filesystem::path dd = base / "Downloads"; is_directory(status(dd))) { return dd; }
+			return base;
+		}
+	}
+	return {};
+}
+}
+#else
+    #include <sys/types.h>
+    #include <pwd.h>
+
+namespace {
+std::filesystem::path get_default_save_dir() {
+	struct passwd *pw = getpwuid(getuid());
+	if (pw && pw->pw_dir) { return { pw->pw_dir }; }
+
+	// Fallbacks
+	if (const char *home_env = std::getenv("HOME")) { return { home_env }; }
+	return {};
 }
 }
 #endif
@@ -113,6 +171,10 @@ enum class Command {
 	QUIT,
 	/// Subscribe to new channel.
 	SUBSCRIBE,
+	/// Unsubscribe from a channel.
+	UNSUBSCRIBE,
+	/// Send a file.
+	SEND_FILE,
 };
 
 Command categorize_command(const string_view &line) {
@@ -120,15 +182,20 @@ Command categorize_command(const string_view &line) {
 	if (line.size() >= 2 && line[1] == '/') { return Command::ESCAPE; }
 	// /quit
 	if (line.substr(1, 4) == "quit") { return Command::QUIT; }
-	// /sub key/expr/to/topic
+	// /sub key/expr/to/topic...
 	if (line.substr(1, 3) == "sub") { return Command::SUBSCRIBE; }
+	// /unsub key/expr/to/topic...
+	if (line.substr(1, 5) == "unsub") { return Command::UNSUBSCRIBE; }
+	// /send path/to/single/file
+	if (line.substr(1, 4) == "send") { return Command::SEND_FILE; }
 	return Command::INVALID;
 }
 
-zenoh::Bytes build_chat_message_metadata(const string_view &mime_type, const size_t content_size) {
+zenoh::Bytes build_chat_message_metadata(const string_view &mime_type, const size_t content_size, const string_view &file_name = "") {
 	auto fbb = flatbuffers::FlatBufferBuilder{ 128 };
 	const auto mime_type_ser = fbb.CreateString(mime_type);
-	fbb.Finish(CreateChatMessageMetadata(fbb, mime_type_ser, content_size));
+	const auto file_name_ser = file_name.empty() ? 0 : fbb.CreateString(file_name);
+	fbb.Finish(CreateChatMessageMetadata(fbb, mime_type_ser, content_size, file_name_ser));
 	auto buf = fbb.Release();
 	uint8_t *ptr = buf.data(); //NOTE: Must store in variable to enforce execution order!
 	const size_t size = buf.size(); //NOTE: Must store in variable to enforce execution order!
@@ -137,7 +204,7 @@ zenoh::Bytes build_chat_message_metadata(const string_view &mime_type, const siz
 	};
 }
 
-optional<vector<zenoh::Subscriber<void>>> handle_command_sub(const string_view &line, const zenoh::Session &session, zenoh::ZResult *err = nullptr) {
+optional<vector<zenoh::Subscriber<void>>> handle_command_sub(const string_view &line, const zenoh::Session &session, zenoh::ZResult *zerr = nullptr) {
 	if (line.back() == '/') { return nullopt; } // In no case might the last char be '/'
 
 	vector<string_view> keys{};
@@ -167,65 +234,119 @@ optional<vector<zenoh::Subscriber<void>>> handle_command_sub(const string_view &
 			key,
 			[key = string{ key }](const zenoh::Sample &sample) {
 				auto attachment = sample.get_attachment();
-				if (!attachment.has_value()) {
+				if (!attachment) {
 					insert_error(ostringstream{} << "Corrupted payload received from " << key << ": missing metadata.");
 					return;
 				}
 
 				// Read & verify the metadata itself
-				auto metadata_buffer = attachment->get().as_vector(); // Copied here; fine
-				if (flatbuffers::Verifier v{ metadata_buffer.data(), metadata_buffer.size() }; !VerifyChatMessageMetadataBuffer(v)) {
+				auto buf = attachment->get().as_vector(); // Copied here; fine
+				if (flatbuffers::Verifier v{ buf.data(), buf.size() }; !VerifyChatMessageMetadataBuffer(v)) {
 					insert_error(ostringstream{} << "Corrupted payload received from " << key << ": bad metadata.");
 					return;
 				}
 
 				// Use the metadata to verify the payload
-				const auto *metadata = GetChatMessageMetadata(metadata_buffer.data());
-				const string_view mime_type = metadata->mime_type()->string_view();
-				if (mime_type.find("text/") == string_view::npos) {
-					insert_error(ostringstream{} << "Unsupported message type \"" << mime_type << "\".");
-					return;
-				}
+				const auto *metadata = GetChatMessageMetadata(buf.data());
 				const auto &payload = sample.get_payload();
-				if (payload.size() != metadata->content_size()) {
+				const uint64_t content_size = metadata->content_size();
+				if (payload.size() != content_size) {
 					insert_error(ostringstream{} << "Corrupted payload received from " << key << ": broken payload.");
 					return;
 				}
 
-				// Use payload in a zero-copy manner
-				{
+				// Use payload in a zero-copy manner, according to its MIME type
+				const string_view mime_type = metadata->mime_type()->string_view();
+				if (mime_type.find("text/") == string_view::npos) { // Not text
+					const string_view file_name = metadata->file_name()->string_view();
+					{
+						lock_guard _{ current_input_mutex };
+						cout << ANSI_CLEAR_LINE;
+						cout << ANSI_STYLE_REGULAR_BG_SKY << '[' << key << ']' << ANSI_STYLE_REGULAR_GRAY << " >> " << ANSI_STYLE_RESET;
+						cout << ANSI_STYLE_REGULAR_WHITE << file_name;
+						cout << ANSI_STYLE_REGULAR_GRAY << " (" << content_size << " B), saving..." << ANSI_STYLE_RESET << '\n';
+						cout << current_input_prompt << current_input << flush;
+					}
+					filesystem::path save_path = get_default_save_dir() / file_name;
+					ofstream f{ save_path, std::ios::binary };
+					auto i = payload.slice_iter();
+					for (auto it = i.next(); it.has_value(); it = i.next()) {
+						const auto slice = it.value();
+						f.write(reinterpret_cast<const char*>(slice.data), slice.len);
+					}
+					f.close();
+					insert_system_message(ostringstream{} << "File written to:\n" << save_path, ANSI_STYLE_REGULAR_GREEN);
+				}
+				else { // Text
 					lock_guard _{ current_input_mutex };
 					cout << ANSI_CLEAR_LINE;
 					cout << ANSI_STYLE_REGULAR_BG_SKY << '[' << key << ']' << ANSI_STYLE_REGULAR_GRAY << " >> " << ANSI_STYLE_RESET;
 					auto i = payload.slice_iter();
 					for (auto it = i.next(); it.has_value(); it = i.next()) {
 						const auto slice = it.value();
-						// According to the metadata, we are now sure the data is text, so `reinterpret_cast` is safe
 						cout << string_view{ reinterpret_cast<const char*>(slice.data), slice.len };
 					}
 					cout << '\n';
 					cout << current_input_prompt << current_input << flush;
 				}
 			},
-#ifdef DEBUG
-			[key = string{ key }]() { printf("- [%s]\n", key.c_str()); },
-#else
-			zenoh::closures::none,
-#endif
-			zenoh::Session::SubscriberOptions::create_default(), err
+			[key = string{ key }]() {
+				insert_system_message(ostringstream{} << "Unsubscribed from " << key << '.');
+			},
+			zenoh::Session::SubscriberOptions::create_default(), zerr
 		);
-		if (*err != Z_OK) {
+		if (*zerr != Z_OK) {
 			subscribers.clear();
 			return subscribers; // Return an empty vector to indicate API failure
 		}
 		else {
 			subscribers.push_back(std::move(subscriber));
-#ifdef DEBUG
-			printf("+ [%s]\n", key.data());
-#endif
+			insert_system_message(ostringstream{} << "Subscribed to " << key << '.');
 		}
 	}
 	return !subscribers.empty() ? optional{ std::move(subscribers) } : nullopt;
+}
+
+optional<size_t> handle_command_send_file(const string_view &line, const zenoh::Publisher &publisher, zenoh::ZResult *zerr = nullptr, error_code *ferr = nullptr) {
+	if (line.size() <= 6) { return nullopt; }
+
+	// Interpret everything after "/send " as a single path
+	size_t end = 5;
+	size_t begin = line.find_first_not_of(" \t", end);
+	if (begin == end || begin == string_view::npos) { return nullopt; }
+	end = line.find_last_not_of(" \t");
+	const filesystem::path path{ line.substr(begin, end - begin + 1) };
+
+	error_code _e; // Backing field
+	error_code &e = ferr ? *ferr : _e;
+
+	// Stat file
+	if (const auto stat = filesystem::status(path); !is_regular_file(stat)) {
+		e = make_error_code(is_directory(stat) ? errc::is_a_directory : errc::no_such_file_or_directory);
+		if (ferr) { return 0; }
+		else { throw filesystem::filesystem_error{ "not a file", path, e }; }
+	}
+
+	// Make mmap
+	auto rm = mio::make_mmap_source(path.c_str(), 0, mio::map_entire_file, e);
+	if (e) {
+		if (ferr) { return 0; }
+		else { throw filesystem::filesystem_error{ "failed to map", path, e }; }
+	}
+	const size_t content_size = rm.size();
+
+	// Send
+	auto put_opt = zenoh::Publisher::PutOptions::create_default();
+	put_opt.attachment = build_chat_message_metadata("application/octet-stream", content_size, path.filename().string() /* respects `chcp` on Windows */);
+	put_opt.encoding = zenoh::Encoding::Predefined::application_octet_stream();
+	const char *ptr = rm.data(); //NOTE: Must store in variable to enforce execution order!
+	publisher.put(
+		zenoh::Bytes{ (uint8_t*)ptr, content_size, [moved = std::move(rm)](uint8_t *) {} }, // ptr is never written to; just to satisfy deleter signature
+		std::move(put_opt),
+		zerr
+	);
+
+	return content_size;
 }
 }
 
@@ -253,14 +374,14 @@ int main(int argc, char *argv[]) {
 	//endregion
 
 	//region Initialize Zenoh
-	zenoh::ZResult err;
+	zenoh::ZResult zerr;
 	string config_path{ "./config.json5" };
-	auto config = zenoh::Config::from_file(config_path, &err);
-	if (err == Z_OK) {
+	auto config = zenoh::Config::from_file(config_path, &zerr);
+	if (zerr == Z_OK) {
 		cout << ANSI_STYLE_REGULAR_GRAY << "Loaded Zenoh config: " << config_path << '.' << ANSI_STYLE_RESET << endl;
 	}
 	else {
-		cout << ANSI_STYLE_REGULAR_YELLOW << "Unable to load " << config_path << " (" << static_cast<int>(err) << ").\n" << ANSI_STYLE_RESET;
+		cout << ANSI_STYLE_REGULAR_YELLOW << "Unable to load " << config_path << " (" << static_cast<int>(zerr) << ").\n" << ANSI_STYLE_RESET;
 		cout << ANSI_STYLE_REGULAR_GRAY << "Using default Zenoh config.\n" << ANSI_STYLE_RESET;
 		cout << flush;
 		config = zenoh::Config::create_default();
@@ -268,26 +389,26 @@ int main(int argc, char *argv[]) {
 	auto session = zenoh::Session::open(
 		std::move(config),
 		zenoh::Session::SessionOptions::create_default(),
-		&err
+		&zerr
 	);
-	if (err != Z_OK) {
+	if (zerr != Z_OK) {
 		cerr << ANSI_STYLE_REGULAR_RED << "Failed to create Zenoh session." << ANSI_STYLE_RESET << endl;
-		return err;
+		return zerr;
 	}
 	//endregion
 
 	//region Become a publisher
-	auto key_expr = session.declare_keyexpr(key, &err);
-	if (err != Z_OK) {
+	auto key_expr = session.declare_keyexpr(key, &zerr);
+	if (zerr != Z_OK) {
 		cerr << ANSI_STYLE_REGULAR_RED << "Failed to declare Zenoh key expression." << ANSI_STYLE_RESET << endl;
-		return err;
+		return zerr;
 	}
 	auto pub_opt = zenoh::Session::PublisherOptions::create_default();
 	pub_opt.congestion_control = Z_CONGESTION_CONTROL_BLOCK; //NOTE: Congestion control must be set
-	auto publisher = session.declare_publisher(key_expr, std::move(pub_opt), &err);
-	if (err != Z_OK) {
+	auto publisher = session.declare_publisher(key_expr, std::move(pub_opt), &zerr);
+	if (zerr != Z_OK) {
 		cerr << ANSI_STYLE_REGULAR_RED << "Failed to declare Zenoh publisher." << ANSI_STYLE_RESET << endl;
-		return err;
+		return zerr;
 	}
 	//endregion
 
@@ -350,9 +471,10 @@ int main(int argc, char *argv[]) {
 					const string_view content{ line };
 					auto put_opt = zenoh::Publisher::PutOptions::create_default();
 					put_opt.attachment = build_chat_message_metadata("text/plain", content.size());
-					publisher.put({ content }, std::move(put_opt), &err); //NOTE: Copied here; impl zero copy for your specific need!
-					if (err != Z_OK) {
-						cerr << ANSI_STYLE_REGULAR_RED << "Failed to publish text (" << static_cast<int>(err) << ")." << ANSI_STYLE_RESET << endl;
+					put_opt.encoding = zenoh::Encoding::Predefined::text_plain();
+					publisher.put({ content }, std::move(put_opt), &zerr); //NOTE: Copied here; impl zero copy for your specific need!
+					if (zerr != Z_OK) {
+						cerr << ANSI_STYLE_REGULAR_RED << "Failed to publish text (" << static_cast<int>(zerr) << ")." << ANSI_STYLE_RESET << endl;
 					}
 				}
 				else {
@@ -361,20 +483,21 @@ int main(int argc, char *argv[]) {
 						const string_view content = string_view{ line }.substr(1);
 						auto put_opt = zenoh::Publisher::PutOptions::create_default();
 						put_opt.attachment = build_chat_message_metadata("text/plain", content.size());
-						publisher.put({ content }, std::move(put_opt), &err); //NOTE: Copied here; impl zero copy for your specific need!
-						if (err != Z_OK) {
-							cerr << ANSI_STYLE_REGULAR_RED << "Failed to publish text (" << static_cast<int>(err) << ")." << ANSI_STYLE_RESET << endl;
+						put_opt.encoding = zenoh::Encoding::Predefined::text_plain();
+						publisher.put({ content }, std::move(put_opt), &zerr); //NOTE: Copied here; impl zero copy for your specific need!
+						if (zerr != Z_OK) {
+							cerr << ANSI_STYLE_REGULAR_RED << "Failed to publish text (" << static_cast<int>(zerr) << ")." << ANSI_STYLE_RESET << endl;
 						}
 						break;
 					}
 					case Command::QUIT: { goto epilogue; }
 					case Command::SUBSCRIBE: {
-						auto result = handle_command_sub(line, session, &err);
-						if (!result.has_value()) {
+						auto result = handle_command_sub(line, session, &zerr);
+						if (!result) {
 							cerr << ANSI_STYLE_REGULAR_RED << "Unable to process command line \"" << line << "\": invalid syntax." << ANSI_STYLE_RESET << endl;
 						}
-						else if (err != Z_OK) { // When API fails, empty vector is returned
-							cerr << ANSI_STYLE_REGULAR_RED << "Failed to subscribe (" << static_cast<int>(err) << ")." << ANSI_STYLE_RESET << endl;
+						else if (zerr != Z_OK) { // When API fails, empty vector is returned
+							cerr << ANSI_STYLE_REGULAR_RED << "Failed to subscribe (" << static_cast<int>(zerr) << ")." << ANSI_STYLE_RESET << endl;
 						}
 						else {
 							subscribers.reserve(subscribers.size() + result.value().size());
@@ -383,6 +506,23 @@ int main(int argc, char *argv[]) {
 								make_move_iterator(result.value().begin()),
 								make_move_iterator(result.value().end())
 							);
+						}
+						break;
+					}
+					case Command::SEND_FILE: {
+						error_code ferr;
+						auto result = handle_command_send_file(line, publisher, &zerr, &ferr);
+						if (!result) {
+							cerr << ANSI_STYLE_REGULAR_RED << "Unable to process command line \"" << line << "\": invalid syntax." << ANSI_STYLE_RESET << endl;
+						}
+						else if (ferr) {
+							cerr << ANSI_STYLE_REGULAR_RED << "Unable to open file: " << ferr.message() << '.' << ANSI_STYLE_RESET << endl;
+						}
+						else if (zerr != Z_OK) {
+							cerr << ANSI_STYLE_REGULAR_RED << "Failed to send file (" << static_cast<int>(zerr) << ")." << ANSI_STYLE_RESET << endl;
+						}
+						else {
+							cout << ANSI_STYLE_REGULAR_GRAY << "Sent content size: " << result.value() << " B." << ANSI_STYLE_RESET << endl;
 						}
 						break;
 					}

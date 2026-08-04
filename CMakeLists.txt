@@ -38,12 +38,19 @@ FetchContent_Declare(
     GIT_TAG "v25.12.19-2026-02-06-03fffb2"
     GIT_SHALLOW TRUE
 )
+FetchContent_Declare(
+    Mio
+    GIT_REPOSITORY https://github.com/vimpunk/mio.git
+    GIT_TAG "8b6b7d878c89e81614d05edca7936de41ccdd2da"
+    GIT_SHALLOW TRUE
+)
 
 # Fetch all dependencies
 FetchContent_MakeAvailable(ZenohC ZenohCpp)
 set(FLATBUFFERS_BUILD_TESTS FALSE CACHE INTERNAL "" FORCE)
 set(FLATBUFFERS_BUILD_FLATC FALSE CACHE INTERNAL "" FORCE)
 FetchContent_MakeAvailable(FlatBuffers)
+FetchContent_MakeAvailable(Mio)
 
 # Local install (adapted from zenohc's CMakeLists.txt)
 if (BUILD_SHARED_LIBS)
@@ -89,7 +96,7 @@ target_link_libraries(schemas INTERFACE flatbuffers)
 
 # Main executable
 add_executable(chat src/chat.cpp src/ansi_sequences.h)
-target_link_libraries(chat schemas zenohc::lib zenohcxx::zenohc)
+target_link_libraries(chat schemas zenohc::lib zenohcxx::zenohc mio::mio)
 
 # Define the macro "DEBUG" if building with debug profile
 target_compile_definitions(chat PRIVATE $<$<CONFIG:Debug>:DEBUG>)
