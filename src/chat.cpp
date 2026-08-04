@@ -4,8 +4,12 @@
 #include <vector>
 #include <string>
 #include <string_view>
+#include <iterator>
 #include <optional>
 #include <mutex>
+#include <algorithm>
+#include <type_traits>
+
 #include <zenoh.hxx>
 
 #include "schema/message.h"
@@ -60,12 +64,46 @@ string current_input_prompt{};
 mutex current_input_mutex{};
 }
 
-// Impl
+// Printing Impl
 namespace {
 void print_usage(const char *progname) {
 	cout << "Usage: " << progname << ' ' << ANSI_STYLE_REGULAR_WHITE << "KEY_EXPR" << ANSI_STYLE_RESET << endl;
 }
 
+/// Locks `current_input_mutex`.
+template <typename T>
+void insert_system_message(T &&message, const char *ansi_style = ANSI_STYLE_REGULAR_GRAY) {
+	lock_guard _{ current_input_mutex };
+	cout << ANSI_CLEAR_LINE;
+	cerr << ansi_style << std::forward<T>(message) << ANSI_STYLE_RESET << endl;
+	cout << current_input_prompt << current_input << flush;
+}
+
+template <>
+void insert_system_message(ostringstream &&oss, const char *ansi_style) {
+	insert_system_message(std::move(oss).str(), ansi_style);
+}
+
+template <>
+void insert_system_message(const ostringstream &oss, const char *ansi_style) {
+	insert_system_message(oss.str(), ansi_style);
+}
+
+/// Locks `current_input_mutex`.
+template <typename T>
+void insert_error(T &&message) {
+	insert_system_message(std::forward<T>(message), ANSI_STYLE_REGULAR_RED);
+}
+
+/// Locks `current_input_mutex`.
+template <typename T>
+void insert_warning(T &&message) {
+	insert_system_message(std::forward<T>(message), ANSI_STYLE_REGULAR_YELLOW);
+}
+}
+
+// Service Impl
+namespace {
 enum class Command {
 	/// Invalid command.
 	INVALID = -1,
@@ -87,11 +125,16 @@ Command categorize_command(const string_view &line) {
 	return Command::INVALID;
 }
 
-flatbuffers::DetachedBuffer build_chat_message_metadata(const std::string_view &text, const char *mime_type = "text/plain") {
+zenoh::Bytes build_chat_message_metadata(const string_view &mime_type, const size_t content_size) {
 	auto fbb = flatbuffers::FlatBufferBuilder{ 128 };
 	const auto mime_type_ser = fbb.CreateString(mime_type);
-	fbb.Finish(CreateChatMessageMetadata(fbb, mime_type_ser, text.size()));
-	return fbb.Release();
+	fbb.Finish(CreateChatMessageMetadata(fbb, mime_type_ser, content_size));
+	auto buf = fbb.Release();
+	uint8_t *ptr = buf.data(); //NOTE: Must store in variable to enforce execution order!
+	const size_t size = buf.size(); //NOTE: Must store in variable to enforce execution order!
+	return zenoh::Bytes{
+		ptr, size, [moved = std::move(buf)](uint8_t *) {}
+	};
 }
 
 optional<vector<zenoh::Subscriber<void>>> handle_command_sub(const string_view &line, const zenoh::Session &session, zenoh::ZResult *err = nullptr) {
@@ -125,16 +168,14 @@ optional<vector<zenoh::Subscriber<void>>> handle_command_sub(const string_view &
 			[key = string{ key }](const zenoh::Sample &sample) {
 				auto attachment = sample.get_attachment();
 				if (!attachment.has_value()) {
+					insert_error(ostringstream{} << "Corrupted payload received from " << key << ": missing metadata.");
 					return;
 				}
 
 				// Read & verify the metadata itself
 				auto metadata_buffer = attachment->get().as_vector(); // Copied here; fine
 				if (flatbuffers::Verifier v{ metadata_buffer.data(), metadata_buffer.size() }; !VerifyChatMessageMetadataBuffer(v)) {
-					lock_guard _{ current_input_mutex };
-					cout << ANSI_CLEAR_LINE;
-					cerr << ANSI_STYLE_REGULAR_RED << "Corrupted payload received from " << key << ": bad metadata." << ANSI_STYLE_RESET << endl;
-					cout << current_input_prompt << current_input << flush;
+					insert_error(ostringstream{} << "Corrupted payload received from " << key << ": bad metadata.");
 					return;
 				}
 
@@ -142,18 +183,12 @@ optional<vector<zenoh::Subscriber<void>>> handle_command_sub(const string_view &
 				const auto *metadata = GetChatMessageMetadata(metadata_buffer.data());
 				const string_view mime_type = metadata->mime_type()->string_view();
 				if (mime_type.find("text/") == string_view::npos) {
-					lock_guard _{ current_input_mutex };
-					cout << ANSI_CLEAR_LINE;
-					cerr << ANSI_STYLE_REGULAR_RED << "Unsupported message type \"" << mime_type << "\"." << ANSI_STYLE_RESET << endl;
-					cout << current_input_prompt << current_input << flush;
+					insert_error(ostringstream{} << "Unsupported message type \"" << mime_type << "\".");
 					return;
 				}
 				const auto &payload = sample.get_payload();
 				if (payload.size() != metadata->content_size()) {
-					lock_guard _{ current_input_mutex };
-					cout << ANSI_CLEAR_LINE;
-					cerr << ANSI_STYLE_REGULAR_RED << "Corrupted payload received from " << key << ": broken payload." << ANSI_STYLE_RESET << endl;
-					cout << current_input_prompt << current_input << flush;
+					insert_error(ostringstream{} << "Corrupted payload received from " << key << ": broken payload.");
 					return;
 				}
 
@@ -267,10 +302,13 @@ int main(int argc, char *argv[]) {
 		string line{};
 		line.reserve(16384);
 		while (true) {
-			cout << current_input_prompt << flush;
-
 			// Interactive CLI: basically just to read a line into `line`
 			{
+				{
+					lock_guard _{ current_input_mutex };
+					cout << ANSI_CLEAR_LINE << current_input_prompt << flush;
+				}
+
 				int ch;
 				do {
 					ch = getkey();
@@ -310,15 +348,9 @@ int main(int argc, char *argv[]) {
 			if (!line.empty()) {
 				if (line[0] != '/') {
 					const string_view content{ line };
-					flatbuffers::DetachedBuffer metadata_buffer = build_chat_message_metadata(content);
-					uint8_t *ptr = metadata_buffer.data(); //NOTE: Must store in variable to enforce execution order!
-					size_t size = metadata_buffer.size(); //NOTE: Must store in variable to enforce execution order!
 					auto put_opt = zenoh::Publisher::PutOptions::create_default();
-					put_opt.attachment = zenoh::Bytes{
-						ptr, size, [moved = std::move(metadata_buffer)](uint8_t *) {}
-					};
-					zenoh::Bytes payload{ content }; //NOTE: Copied here; impl zero copy for your specific need!
-					publisher.put(std::move(payload), std::move(put_opt), &err);
+					put_opt.attachment = build_chat_message_metadata("text/plain", content.size());
+					publisher.put({ content }, std::move(put_opt), &err); //NOTE: Copied here; impl zero copy for your specific need!
 					if (err != Z_OK) {
 						cerr << ANSI_STYLE_REGULAR_RED << "Failed to publish text (" << static_cast<int>(err) << ")." << ANSI_STYLE_RESET << endl;
 					}
@@ -327,15 +359,9 @@ int main(int argc, char *argv[]) {
 					switch (categorize_command(line)) {
 					case Command::ESCAPE: {
 						const string_view content = string_view{ line }.substr(1);
-						flatbuffers::DetachedBuffer metadata_buffer = build_chat_message_metadata(content);
-						uint8_t *ptr = metadata_buffer.data(); //NOTE: Must store in variable to enforce execution order!
-						size_t size = metadata_buffer.size(); //NOTE: Must store in variable to enforce execution order!
 						auto put_opt = zenoh::Publisher::PutOptions::create_default();
-						put_opt.attachment = zenoh::Bytes{
-							ptr, size, [moved = std::move(metadata_buffer)](uint8_t *) {}
-						};
-						zenoh::Bytes payload{ content }; //NOTE: Copied here; impl zero copy for your specific need!
-						publisher.put(std::move(payload), std::move(put_opt), &err);
+						put_opt.attachment = build_chat_message_metadata("text/plain", content.size());
+						publisher.put({ content }, std::move(put_opt), &err); //NOTE: Copied here; impl zero copy for your specific need!
 						if (err != Z_OK) {
 							cerr << ANSI_STYLE_REGULAR_RED << "Failed to publish text (" << static_cast<int>(err) << ")." << ANSI_STYLE_RESET << endl;
 						}
