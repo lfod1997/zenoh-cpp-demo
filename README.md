@@ -11,6 +11,7 @@
    - `ZENOHC_BUILD_WITH_SHARED_MEMORY` 开关（默认关闭）：若要进行本机进程间通讯，则打开
    - `ZENOHC_BUILD_WITH_UNSTABLE_API` 开关（默认关闭）：若要使用实验性 API，则打开
    - `BUILD_SHARED_LIBS` 开关（默认打开）：若要静态链接，则关闭
+   > 配置例：`cmake -S . -B cmake-build-release -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=FALSE`
 6. 构建工程：`cmake --build 构建目录 --target LearnZenohCpp`
 7. （可选）install，将复制各类依赖文件到构建目录的 `installed/` 下：`cmake --build 构建目录 --target install`
 
