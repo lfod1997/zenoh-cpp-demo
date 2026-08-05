@@ -2,6 +2,19 @@ cmake_minimum_required(VERSION 3.25)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+if (WIN32)
+    if (CMAKE_GENERATOR MATCHES "Ninja")
+        # Can't find out if Ninja is using MSVC, just set flags for both and bear with the warnings
+        set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} /utf-8 -finput-charset=UTF-8 -fexec-charset=UTF-8")
+        set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /utf-8 -finput-charset=UTF-8 -fexec-charset=UTF-8")
+    elseif (MSVC)
+        set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} /utf-8")
+        set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /utf-8")
+    else ()
+        set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -finput-charset=UTF-8 -fexec-charset=UTF-8")
+        set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -finput-charset=UTF-8 -fexec-charset=UTF-8")
+    endif ()
+endif ()
 
 # Ensure tools
 find_program(CARGO cargo REQUIRED)
@@ -95,7 +108,12 @@ target_include_directories(schemas INTERFACE "${CMAKE_CURRENT_BINARY_DIR}/genera
 target_link_libraries(schemas INTERFACE flatbuffers)
 
 # Main executable
-add_executable(chat src/chat.cpp src/ansi_sequences.h)
+add_executable(chat
+    src/chat.cpp
+    src/ansi_sequences.h
+    src/utf8_builder.cpp
+    src/utf8_builder.h
+)
 target_link_libraries(chat schemas zenohc::lib zenohcxx::zenohc mio::mio)
 
 # Define the macro "DEBUG" if building with debug profile

@@ -23,6 +23,7 @@
 
 #include "schema/message.h"
 #include "ansi_sequences.h"
+#include "utf8_builder.h"
 
 #if defined(_WIN32) || defined(_WIN64)
 #include <windows.h>
@@ -35,35 +36,83 @@
 #include <conio.h>
 
 namespace {
-void enable_ansi_support() {
+UINT sOrigInCP = GetConsoleCP();
+UINT sOrigOutCP = GetConsoleOutputCP();
+
+void modify_console_settings() {
+	// Enable native ANSI support (Windows 10)
 	HANDLE hOut = GetStdHandle(STD_OUTPUT_HANDLE);
 	if (hOut == INVALID_HANDLE_VALUE) return;
 	DWORD dwMode = 0;
 	if (!GetConsoleMode(hOut, &dwMode)) return;
 	dwMode |= ENABLE_VIRTUAL_TERMINAL_PROCESSING;
 	SetConsoleMode(hOut, dwMode);
+
+	// Change current code page
+	if (!SetConsoleCP(CP_UTF8)) {
+		printf("%sCould not set input code page to UTF-8 (%lu).%s\n", ANSI_STYLE_REGULAR_YELLOW, GetLastError(), ANSI_STYLE_RESET);
+	}
+	if (!SetConsoleOutputCP(CP_UTF8)) {
+		printf("%sCould not set output code page to UTF-8 (%lu).%s\n", ANSI_STYLE_REGULAR_YELLOW, GetLastError(), ANSI_STYLE_RESET);
+	}
 }
 
 int getkey() { return _getch(); }
+
+void restore_console_settings() {
+	// Restore code page
+	SetConsoleCP(sOrigInCP);
+	SetConsoleOutputCP(sOrigOutCP);
+}
+
+std::string u8_to_cp(const std::string_view &str, const UINT cp) {
+	if (cp == CP_UTF8) { return std::string{ str }; }
+	const int wlen = MultiByteToWideChar(CP_UTF8, 0, str.data(), (int)str.size(), nullptr, 0);
+	if (wlen == 0) { return ""; }
+	std::wstring wstr(wlen, 0);
+	MultiByteToWideChar(CP_UTF8, 0, str.data(), (int)str.size(), wstr.data(), wlen);
+	const int olen = WideCharToMultiByte(cp, 0, wstr.data(), wlen, nullptr, 0, nullptr, nullptr);
+	if (olen == 0) { return ""; }
+	std::string ostr(olen, 0);
+	WideCharToMultiByte(cp, 0, wstr.data(), wlen, ostr.data(), olen, nullptr, nullptr);
+	return ostr;
+}
 }
 #else
 #include <termios.h>
 
 namespace {
-void enable_ansi_support() {}
+struct termios t_old;
 
-int getkey() {
-	struct termios t_old, t_new;
+void modify_console_settings() {
+	struct termios t_new;
 	tcgetattr(STDIN_FILENO, &t_old);
 	t_new = t_old;
 	t_new.c_lflag &= ~(ICANON | ECHO | ISIG);
 	tcsetattr(STDIN_FILENO, TCSANOW, &t_new);
-	int ch = getchar();
+}
+
+int getkey() { return getchar(); }
+
+void restore_console_settings() {
 	tcsetattr(STDIN_FILENO, TCSANOW, &t_old);
-	return ch;
 }
 }
 #endif
+namespace {
+class ConsoleSettingsGuard final {
+public:
+	ConsoleSettingsGuard() { modify_console_settings(); }
+
+	~ConsoleSettingsGuard() { restore_console_settings(); }
+
+	ConsoleSettingsGuard(const ConsoleSettingsGuard &) = delete;
+	ConsoleSettingsGuard& operator=(const ConsoleSettingsGuard &) = delete;
+	ConsoleSettingsGuard(ConsoleSettingsGuard &&) = default;
+	ConsoleSettingsGuard& operator=(ConsoleSettingsGuard &&) = default;
+};
+}
+
 //endregion
 
 //region Portable Default Save Dir Getter
@@ -119,6 +168,7 @@ using namespace ZenohCppDemo::Schema;
 namespace {
 string current_input{};
 string current_input_prompt{};
+bool current_input_is_open{ false };
 mutex current_input_mutex{};
 }
 
@@ -132,9 +182,14 @@ void print_usage(const char *progname) {
 template <typename T>
 void insert_system_message(T &&message, const char *ansi_style = ANSI_STYLE_REGULAR_GRAY) {
 	lock_guard _{ current_input_mutex };
-	cout << ANSI_CLEAR_LINE;
-	cerr << ansi_style << std::forward<T>(message) << ANSI_STYLE_RESET << endl;
-	cout << current_input_prompt << current_input << flush;
+	if (current_input_is_open) {
+		cout << ANSI_CLEAR_LINE;
+		cerr << ansi_style << std::forward<T>(message) << ANSI_STYLE_RESET << '\n';
+		cout << current_input_prompt << current_input << flush;
+	}
+	else {
+		cerr << ansi_style << std::forward<T>(message) << ANSI_STYLE_RESET << endl;
+	}
 }
 
 template <>
@@ -315,7 +370,13 @@ optional<size_t> handle_command_send_file(const string_view &line, const zenoh::
 	size_t begin = line.find_first_not_of(" \t", end);
 	if (begin == end || begin == string_view::npos) { return nullopt; }
 	end = line.find_last_not_of(" \t");
-	const filesystem::path path{ line.substr(begin, end - begin + 1) };
+	filesystem::path path{
+#if defined(_WIN32) || defined(_WIN64)
+		u8_to_cp(line.substr(begin, end - begin + 1), sOrigOutCP)
+#else
+		line.substr(begin, end - begin + 1)
+#endif
+	};
 
 	error_code _e; // Backing field
 	error_code &e = ferr ? *ferr : _e;
@@ -336,8 +397,11 @@ optional<size_t> handle_command_send_file(const string_view &line, const zenoh::
 	const size_t content_size = rm.size();
 
 	// Send
+#if defined(_WIN32) || defined(_WIN64)
+	path = line.substr(begin, end - begin + 1); // UTF-8
+#endif
 	auto put_opt = zenoh::Publisher::PutOptions::create_default();
-	put_opt.attachment = build_chat_message_metadata("application/octet-stream", content_size, path.filename().string() /* respects `chcp` on Windows */);
+	put_opt.attachment = build_chat_message_metadata("application/octet-stream", content_size, path.filename().string());
 	put_opt.encoding = zenoh::Encoding::Predefined::application_octet_stream();
 	const char *ptr = rm.data(); //NOTE: Must store in variable to enforce execution order!
 	publisher.put(
@@ -352,7 +416,7 @@ optional<size_t> handle_command_send_file(const string_view &line, const zenoh::
 
 int main(int argc, char *argv[]) {
 	//region Initialize program
-	enable_ansi_support();
+	[[maybe_unused]] ConsoleSettingsGuard _csg{};
 	current_input.reserve(16384);
 	ios_base::sync_with_stdio(true);
 	//endregion
@@ -417,11 +481,16 @@ int main(int argc, char *argv[]) {
 	// Main loop
 	{
 		current_input_prompt = (
-			ostringstream{} << ANSI_STYLE_REGULAR_BG_GRAY << '[' << key << ']' << ANSI_STYLE_REGULAR_GRAY << " << " << ANSI_STYLE_RESET
+			ostringstream{} << ANSI_STYLE_REGULAR_BG_SILVER << '[' << key << ']' << ANSI_STYLE_REGULAR_GRAY << " << " << ANSI_STYLE_RESET
 		).str();
 
+		Utf8Builder u8buf{};
 		string line{};
 		line.reserve(16384);
+		{
+			lock_guard _{ current_input_mutex };
+			current_input_is_open = true;
+		}
 		while (true) {
 			// Interactive CLI: basically just to read a line into `line`
 			{
@@ -436,15 +505,22 @@ int main(int argc, char *argv[]) {
 					lock_guard _{ current_input_mutex };
 					if (ch == '\x08' || ch == '\x7f') { // Backspace key
 						if (!current_input.empty()) {
+							// Delete all trailing UTF-8 continuation bytes, if any
+							while ((current_input.back() & 0xc0) == 0x80) {
+								current_input.pop_back();
+							}
+							// Delete the UTF-8 leading byte
 							current_input.pop_back();
-							cout << ANSI_REMOVE_CHAR;
 						}
+						// Redraw entire line
+						cout << ANSI_CLEAR_LINE << current_input_prompt << current_input;
 					}
 					else if (ch == '\x1b') { // Escape key
 						current_input.clear();
 						cout << ANSI_CLEAR_LINE << current_input_prompt;
 					}
 					else if (ch == '\x03' || ch == '\x1c') { // Keyboard interrupt (Ctrl+C or Ctrl+\)
+						current_input_is_open = false;
 						cout << endl;
 						goto epilogue;
 					}
@@ -454,11 +530,32 @@ int main(int argc, char *argv[]) {
 							cout << '\n' << flush;
 							break;
 						}
-						else { continue; }
+						else {
+							cout << ANSI_CLEAR_LINE << current_input_prompt << current_input;
+						}
 					}
 					else {
-						current_input.push_back(static_cast<char>(ch));
-						cout << static_cast<char>(ch);
+						switch (u8buf.push_back(static_cast<char>(ch))) {
+						case Utf8Builder::State::WAITING: { break; }
+						case Utf8Builder::State::GOOD_CODE: {
+							u8buf.pour(&current_input);
+							cout << ANSI_CLEAR_LINE << current_input_prompt << current_input;
+							break;
+						}
+						case Utf8Builder::State::BAD_CODE:
+						case Utf8Builder::State::OVER_FLOWN: {
+							cout << ANSI_STYLE_REGULAR_BG_GRAY;
+							const char *buf = u8buf.data();
+							for (int i = 0; i < 4; ++i) {
+								if (buf[i] == 0) { break; }
+								printf("%02x", buf[i] & 0xff);
+							}
+							printf("%02x", ch);
+							cout << ANSI_STYLE_RESET;
+							u8buf.pour();
+							break;
+						}
+						}
 					}
 					cout << flush;
 				}
@@ -490,7 +587,13 @@ int main(int argc, char *argv[]) {
 						}
 						break;
 					}
-					case Command::QUIT: { goto epilogue; }
+					case Command::QUIT: {
+						{
+							lock_guard _{ current_input_mutex };
+							current_input_is_open = false;
+						}
+						goto epilogue;
+					}
 					case Command::SUBSCRIBE: {
 						auto result = handle_command_sub(line, session, &zerr);
 						if (!result) {
@@ -539,5 +642,6 @@ int main(int argc, char *argv[]) {
 
 epilogue:
 	subscribers.clear();
+	cout << ANSI_STYLE_REGULAR_GRAY << "Graceful." << ANSI_STYLE_RESET << endl;
 	return 0;
 }
