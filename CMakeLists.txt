@@ -111,8 +111,7 @@ target_link_libraries(schemas INTERFACE flatbuffers)
 add_executable(chat
     src/chat.cpp
     src/ansi_sequences.h
-    src/utf8_builder.cpp
-    src/utf8_builder.h
+    src/utf8_builder.hpp
 )
 target_link_libraries(chat schemas zenohc::lib zenohcxx::zenohc mio::mio)
 

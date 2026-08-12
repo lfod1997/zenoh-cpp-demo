@@ -23,7 +23,7 @@
 
 #include "schema/message.h"
 #include "ansi_sequences.h"
-#include "utf8_builder.h"
+#include "utf8_builder.hpp"
 
 #if defined(_WIN32) || defined(_WIN64)
 #include <windows.h>
@@ -484,7 +484,7 @@ int main(int argc, char *argv[]) {
 			ostringstream{} << ANSI_STYLE_REGULAR_BG_SILVER << '[' << key << ']' << ANSI_STYLE_REGULAR_GRAY << " << " << ANSI_STYLE_RESET
 		).str();
 
-		Utf8Builder u8buf{};
+		PrintableUtf8Builder u8buf{};
 		string line{};
 		line.reserve(16384);
 		{
@@ -536,14 +536,14 @@ int main(int argc, char *argv[]) {
 					}
 					else {
 						switch (u8buf.push_back(static_cast<char>(ch))) {
-						case Utf8Builder::State::WAITING: { break; }
-						case Utf8Builder::State::GOOD_CODE: {
+						case PrintableUtf8Builder::State::WAITING: { break; }
+						case PrintableUtf8Builder::State::GOOD_CODE: {
 							u8buf.pour(&current_input);
 							cout << ANSI_CLEAR_LINE << current_input_prompt << current_input;
 							break;
 						}
-						case Utf8Builder::State::BAD_CODE:
-						case Utf8Builder::State::OVER_FLOWN: {
+						case PrintableUtf8Builder::State::BAD_CODE:
+						case PrintableUtf8Builder::State::OVER_FLOWN: {
 							cout << ANSI_STYLE_REGULAR_BG_GRAY;
 							const char *buf = u8buf.data();
 							for (int i = 0; i < 4; ++i) {
