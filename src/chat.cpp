@@ -276,8 +276,7 @@ optional<vector<zenoh::Subscriber<void>>> handle_command_sub(const string_view &
 				end = line.find_first_of("/ \t", end + 1);
 				if (end == string_view::npos) { break; } // Done
 				if (line[end - 1] == '/') { return nullopt; } // Invalid syntax: either key ends with '/' or contains "//" (both illegal)
-			}
-			while (line[end] == '/'); // Exit = found space or end of line
+			} while (line[end] == '/'); // Exit = found space or end of line
 			keys.push_back(line.substr(begin, end - begin));
 		}
 	}
@@ -558,8 +557,7 @@ int main(int argc, char *argv[]) {
 						}
 					}
 					cout << flush;
-				}
-				while (true);
+				} while (true);
 			}
 
 			// If `line` begin with '/', handle as command; otherwise, publish as text
@@ -569,10 +567,20 @@ int main(int argc, char *argv[]) {
 					auto put_opt = zenoh::Publisher::PutOptions::create_default();
 					put_opt.attachment = build_chat_message_metadata("text/plain", content.size());
 					put_opt.encoding = zenoh::Encoding::Predefined::text_plain();
-					publisher.put({ content }, std::move(put_opt), &zerr); //NOTE: Copied here; impl zero copy for your specific need!
-					if (zerr != Z_OK) {
-						cerr << ANSI_STYLE_REGULAR_RED << "Failed to publish text (" << static_cast<int>(zerr) << ")." << ANSI_STYLE_RESET << endl;
-					}
+					do {
+						zenoh::Bytes::Writer payload_writer{};
+						payload_writer.append(content, &zerr);
+						if (zerr != Z_OK) {
+							cerr << ANSI_STYLE_REGULAR_RED << "Failed to compose payload (" << static_cast<int>(zerr) << ")." << ANSI_STYLE_RESET << endl;
+							break; // do-while(0)
+						}
+						// ^ More `Bytes` may be appended to `payload_writer`
+						publisher.put(std::move(payload_writer).finish(), std::move(put_opt), &zerr); //NOTE: Copied here; impl zero copy for your specific need!
+						if (zerr != Z_OK) {
+							cerr << ANSI_STYLE_REGULAR_RED << "Failed to publish text (" << static_cast<int>(zerr) << ")." << ANSI_STYLE_RESET << endl;
+							break; // do-while(0)
+						}
+					} while (false);
 				}
 				else {
 					switch (categorize_command(line)) {
@@ -581,11 +589,21 @@ int main(int argc, char *argv[]) {
 						auto put_opt = zenoh::Publisher::PutOptions::create_default();
 						put_opt.attachment = build_chat_message_metadata("text/plain", content.size());
 						put_opt.encoding = zenoh::Encoding::Predefined::text_plain();
-						publisher.put({ content }, std::move(put_opt), &zerr); //NOTE: Copied here; impl zero copy for your specific need!
-						if (zerr != Z_OK) {
-							cerr << ANSI_STYLE_REGULAR_RED << "Failed to publish text (" << static_cast<int>(zerr) << ")." << ANSI_STYLE_RESET << endl;
-						}
-						break;
+						do {
+							zenoh::Bytes::Writer payload_writer{};
+							payload_writer.append(content, &zerr);
+							if (zerr != Z_OK) {
+								cerr << ANSI_STYLE_REGULAR_RED << "Failed to compose payload (" << static_cast<int>(zerr) << ")." << ANSI_STYLE_RESET << endl;
+								break; // do-while(0)
+							}
+							// ^ More `Bytes` may be appended to `payload_writer`
+							publisher.put(std::move(payload_writer).finish(), std::move(put_opt), &zerr); //NOTE: Copied here; impl zero copy for your specific need!
+							if (zerr != Z_OK) {
+								cerr << ANSI_STYLE_REGULAR_RED << "Failed to publish text (" << static_cast<int>(zerr) << ")." << ANSI_STYLE_RESET << endl;
+								break; // do-while(0)
+							}
+						} while (false);
+						break; // switch(categorize_command(line))
 					}
 					case Command::QUIT: {
 						{
