@@ -1,0 +1,9 @@
+module ZenohCppDemo
+{
+    struct Metadata
+    {
+        string mime_type;
+        unsigned long long content_size;
+        string file_name;
+    };
+};
