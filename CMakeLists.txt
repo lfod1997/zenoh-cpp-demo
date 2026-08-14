@@ -1,5 +1,8 @@
 cmake_minimum_required(VERSION 3.25)
 
+# =====================
+# Compiler Preparation
+# =====================
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 if (WIN32)
@@ -16,6 +19,9 @@ if (WIN32)
     endif ()
 endif ()
 
+# =======================================
+# Tool Discovery & Dependency Resolution
+# =======================================
 # Ensure tools
 find_program(CARGO cargo REQUIRED)
 execute_process(COMMAND ${CARGO} --version)
@@ -30,7 +36,7 @@ endif ()
 set(CMAKE_INSTALL_PREFIX ${ideal_install_prefix} CACHE PATH "Fixed install path." FORCE)
 message(STATUS "CMAKE_INSTALL_PREFIX = ${CMAKE_INSTALL_PREFIX}")
 
-# Dependencies
+# Version-controlled Dependencies
 include(FetchContent)
 FetchContent_Declare(
     ZenohC
@@ -59,38 +65,30 @@ FetchContent_Declare(
 )
 
 # Fetch all dependencies
+message("Fetching Zenoh")
 FetchContent_MakeAvailable(ZenohC ZenohCpp)
+message("Fetching FlatBuffers")
 set(FLATBUFFERS_BUILD_TESTS FALSE CACHE INTERNAL "" FORCE)
 set(FLATBUFFERS_BUILD_FLATC FALSE CACHE INTERNAL "" FORCE)
 FetchContent_MakeAvailable(FlatBuffers)
+message("Fetching Mio")
 FetchContent_MakeAvailable(Mio)
 
-# Local install (adapted from zenohc's CMakeLists.txt)
-if (BUILD_SHARED_LIBS)
-    set(cargo_binary_dir_debug "${zenohc_BINARY_DIR}/debug/target/debug")
-    set(cargo_binary_dir_release "${zenohc_BINARY_DIR}/release/target/release")
-    if (WIN32)
-        set(dylib_file_debug "zenohc.dll")
-        set(dylib_file_release "zenohc.dll")
-    elseif (APPLE)
-        set(dylib_file_debug "libzenohc.dylib")
-        set(dylib_file_release "libzenohc.dylib")
-    else () # UNIX
-        set(dylib_file_debug "libzenohc.so")
-        set(dylib_file_release "libzenohc.so")
-    endif ()
-    set(dylib_full_path "$<IF:$<CONFIG:Debug>,${cargo_binary_dir_debug}/${dylib_file_debug},${cargo_binary_dir_release}/${dylib_file_release}>")
-    install(FILES ${dylib_full_path} DESTINATION "${CMAKE_INSTALL_PREFIX}/bin")
-endif ()
-
+# ===================
+# Project Definition
+# ===================
 project(ZenohCppDemo)
 
 # Declare a custom target that compiles all schemas
 set(schema_src_dir "${CMAKE_CURRENT_SOURCE_DIR}/schema")
 set(schema_gen_dir "${CMAKE_CURRENT_BINARY_DIR}/generated/schema")
 file(GLOB schema_src "${schema_src_dir}/*.fbs")
-set(schema_gen ${schema_src})
-list(TRANSFORM schema_gen REPLACE "\\.fbs$" ".gen.h")
+set(schema_gen "")
+foreach (fbs_path IN LISTS schema_src)
+    string(REPLACE ${schema_src_dir} ${schema_gen_dir} _tmp_str ${fbs_path})
+    string(REGEX REPLACE "\\.fbs$" ".h" _tmp_str ${_tmp_str})
+    list(APPEND schema_gen ${_tmp_str})
+endforeach ()
 add_custom_command(
     DEPENDS ${schema_src}
     OUTPUT ${schema_gen}
@@ -118,12 +116,22 @@ target_link_libraries(chat schemas zenohc::lib zenohcxx::zenohc mio::mio)
 # Define the macro "DEBUG" if building with debug profile
 target_compile_definitions(chat PRIVATE $<$<CONFIG:Debug>:DEBUG>)
 
+# ============================
+# Post Build and Installation
+# ============================
 if (BUILD_SHARED_LIBS)
     # Copy shared libraries after building
+    set(_target chat)
     add_custom_command(
-        TARGET chat
+        TARGET ${_target}
         POST_BUILD
-        COMMAND ${CMAKE_COMMAND} -E copy ${dylib_full_path} ${CMAKE_BINARY_DIR}
+        COMMAND ${CMAKE_COMMAND} -E copy "$<TARGET_RUNTIME_DLLS:${_target}>" "$<TARGET_FILE_DIR:${_target}>"
+        COMMAND_EXPAND_LISTS
         COMMENT "Copying shared library"
     )
+    # Install shared libraries
+    install(FILES "$<TARGET_RUNTIME_DLLS:${_target}>" DESTINATION "${CMAKE_INSTALL_PREFIX}/bin")
 endif ()
+
+# Install executable
+install(FILES "$<TARGET_FILE:${_target}>" DESTINATION "${CMAKE_INSTALL_PREFIX}/bin")
