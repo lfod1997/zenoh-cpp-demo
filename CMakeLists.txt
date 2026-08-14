@@ -25,8 +25,15 @@ endif ()
 # Ensure tools
 find_program(CARGO cargo REQUIRED)
 execute_process(COMMAND ${CARGO} --version)
-find_program(FLATC flatc REQUIRED)
-execute_process(COMMAND ${FLATC} --version)
+find_program(JAVA java REQUIRED)
+execute_process(COMMAND ${JAVA} --version)
+find_file(FASTDDSGEN_JAR
+    NAMES "fastddsgen.jar"
+    PATHS "${CMAKE_CURRENT_SOURCE_DIR}/thirdparty/fastddsgen"
+    REQUIRED
+    DOC "Path to the Fast DDS-Gen Java binary (fastddsgen.jar)."
+)
+execute_process(COMMAND ${JAVA} -jar ${FASTDDSGEN_JAR} -version)
 
 # Set install path to somewhere non-system
 set(ideal_install_prefix "${CMAKE_BINARY_DIR}/installed")
@@ -53,12 +60,6 @@ FetchContent_Declare(
     GIT_SUBMODULES "" # The repo contains zenohc as a submodule (unused in cmake)
 )
 FetchContent_Declare(
-    FlatBuffers
-    GIT_REPOSITORY https://github.com/google/flatbuffers.git
-    GIT_TAG "v25.12.19-2026-02-06-03fffb2"
-    GIT_SHALLOW TRUE
-)
-FetchContent_Declare(
     Mio
     GIT_REPOSITORY https://github.com/vimpunk/mio.git
     GIT_TAG "8b6b7d878c89e81614d05edca7936de41ccdd2da"
@@ -68,10 +69,6 @@ FetchContent_Declare(
 # Fetch all dependencies
 message("Fetching Zenoh")
 FetchContent_MakeAvailable(ZenohC ZenohCpp)
-message("Fetching FlatBuffers")
-set(FLATBUFFERS_BUILD_TESTS FALSE CACHE INTERNAL "" FORCE)
-set(FLATBUFFERS_BUILD_FLATC FALSE CACHE INTERNAL "" FORCE)
-FetchContent_MakeAvailable(FlatBuffers)
 message("Fetching Mio")
 FetchContent_MakeAvailable(Mio)
 
@@ -80,21 +77,30 @@ FetchContent_MakeAvailable(Mio)
 # ===================
 project(ZenohCppDemo)
 
+# Repo: https://github.com/eProsima/Fast-CDR.git
+# Versioning (only relevant if you're interfacing ROS2):
+# 1. Go to https://github.com/ros2/ros2/blob/TAG/ros2.repos where TAG is the git tag from which your ROS2 is built
+# 2. Look for `eProsima/Fast-CDR` in the opened file to the version to be used here:
+find_package(fastcdr REQUIRED CONFIG)
+
 # Declare a custom target that compiles all schemas
-set(schema_src_dir "${CMAKE_CURRENT_SOURCE_DIR}/schema")
-set(schema_gen_dir "${CMAKE_CURRENT_BINARY_DIR}/generated/schema")
-file(GLOB schema_src "${schema_src_dir}/*.fbs")
+set(schema_inc_dir "${CMAKE_CURRENT_SOURCE_DIR}/schema")
+set(schema_gen_dir "${CMAKE_CURRENT_BINARY_DIR}/generated")
+file(GLOB schema_src "${CMAKE_CURRENT_SOURCE_DIR}/schema/*.idl")
+set(schema_gen_suffixes ".hpp" "CdrAux.hpp" "CdrAux.ipp")
 set(schema_gen "")
-foreach (fbs_path IN LISTS schema_src)
-    string(REPLACE ${schema_src_dir} ${schema_gen_dir} _tmp_str ${fbs_path})
-    string(REGEX REPLACE "\\.fbs$" ".h" _tmp_str ${_tmp_str})
-    list(APPEND schema_gen ${_tmp_str})
+foreach (suffix IN LISTS schema_gen_suffixes)
+    foreach (idl_path IN LISTS schema_src)
+        string(REPLACE ${CMAKE_CURRENT_SOURCE_DIR} ${schema_gen_dir} _tmp_str ${idl_path})
+        string(REGEX REPLACE "\\.idl$" ${suffix} _tmp_str ${_tmp_str})
+        list(APPEND schema_gen ${_tmp_str})
+    endforeach ()
 endforeach ()
 add_custom_command(
     DEPENDS ${schema_src}
     OUTPUT ${schema_gen}
-    COMMAND ${FLATC} --cpp --filename-suffix "" -I ${schema_src_dir} -o ${schema_gen_dir} ${schema_src}
-    WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+    COMMAND ${JAVA} -jar ${FASTDDSGEN_JAR} -replace -language c++ -typeros2 -I ${schema_inc_dir} -d ${schema_gen_dir} ${schema_src}
+    WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}" # fastddsgen preserves relative directories
     COMMENT "Compiling schemas"
     VERBATIM
 )
@@ -103,8 +109,8 @@ add_custom_target(compile_schemas DEPENDS ${schema_gen})
 # Wrap generated headers to an interface library
 add_library(schemas INTERFACE)
 add_dependencies(schemas compile_schemas)
-target_include_directories(schemas INTERFACE "${CMAKE_CURRENT_BINARY_DIR}/generated")
-target_link_libraries(schemas INTERFACE flatbuffers)
+target_include_directories(schemas INTERFACE ${schema_gen_dir})
+target_link_libraries(schemas INTERFACE fastcdr)
 
 # Main executable
 add_executable(chat
