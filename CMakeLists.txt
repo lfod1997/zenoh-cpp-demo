@@ -38,6 +38,7 @@ message(STATUS "CMAKE_INSTALL_PREFIX = ${CMAKE_INSTALL_PREFIX}")
 
 # Version-controlled Dependencies
 include(FetchContent)
+set(FETCHCONTENT_UPDATES_DISCONNECTED TRUE CACHE INTERNAL "" FORCE)
 FetchContent_Declare(
     ZenohC
     GIT_REPOSITORY https://github.com/eclipse-zenoh/zenoh-c.git
