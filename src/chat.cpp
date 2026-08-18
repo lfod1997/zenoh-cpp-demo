@@ -21,7 +21,7 @@
 #include <zenoh.hxx>
 #include <mio/mmap.hpp>
 
-#include "schema/message.h"
+#include "schema/message.hpp"
 #include "ansi_sequences.h"
 #include "utf8_builder.hpp"
 
@@ -162,10 +162,12 @@ std::filesystem::path get_default_save_dir() {
 //endregion
 
 using namespace std;
-using namespace ZenohCppDemo::Schema;
+using namespace ZenohCppDemo;
 
 // Globals
 namespace {
+constexpr auto CDR_ENDIANNESS = endianness::little_endian;
+
 string current_input{};
 string current_input_prompt{};
 bool current_input_is_open{ false };
@@ -246,17 +248,55 @@ Command categorize_command(const string_view &line) {
 	return Command::INVALID;
 }
 
-zenoh::Bytes build_chat_message_metadata(const string_view &mime_type, const size_t content_size, const string_view &file_name = "") {
-	auto fbb = flatbuffers::FlatBufferBuilder{ 128 };
-	const auto mime_type_ser = fbb.CreateString(mime_type);
-	const auto file_name_ser = file_name.empty() ? 0 : fbb.CreateString(file_name);
-	fbb.Finish(CreateChatMessageMetadata(fbb, mime_type_ser, content_size, file_name_ser));
-	auto buf = fbb.Release();
-	uint8_t *ptr = buf.data(); //NOTE: Must store in variable to enforce execution order!
-	const size_t size = buf.size(); //NOTE: Must store in variable to enforce execution order!
-	return zenoh::Bytes{
-		ptr, size, [moved = std::move(buf)](uint8_t *) {}
-	};
+zenoh::Bytes build_metadata(const string_view &mime_type, const size_t content_size, const string_view &file_name = "") {
+	Metadata metadata{};
+	metadata.mime_type(string{ mime_type }); // Inevitable
+	metadata.content_size(content_size);
+	metadata.file_name(string{ file_name }); // Inevitable
+
+	basic_cdr_stream cdr{ CDR_ENDIANNESS };
+	constexpr uint8_t encap[4]{ 0x00, 0x01, 0x00, 0x00 };
+
+	// TODO: implement this
+	return {};
+}
+
+optional<Metadata> decode_metadata(const zenoh::Bytes &payload) {
+	auto i = payload.slice_iter();
+	auto first_slice_opt = i.next();
+	if (!first_slice_opt.has_value()) { return nullopt; } // Empty payload
+
+	std::vector<char> fallback_buffer;
+	const char *buffer_ptr = nullptr;
+	size_t buffer_len = 0;
+
+	if (!i.next().has_value()) { // Single-slice payload
+		const auto first_slice = first_slice_opt.value();
+		buffer_ptr = reinterpret_cast<const char*>(first_slice.data);
+		buffer_len = first_slice.len;
+	}
+	else { // Multi-slice payload; have to flatten it
+		i = payload.slice_iter();
+		for (auto s = i.next(); s.has_value(); s = i.next()) {
+			const auto slice = s.value();
+			fallback_buffer.insert(
+				fallback_buffer.end(),
+				reinterpret_cast<const char*>(slice.data),
+				reinterpret_cast<const char*>(slice.data) + slice.len
+			);
+		}
+		buffer_ptr = fallback_buffer.data();
+		buffer_len = fallback_buffer.size();
+	}
+
+	basic_cdr_stream cdr;
+	cdr.set_buffer(const_cast<char*>(buffer_ptr) + 4, buffer_len - 4); // Will not actually write to
+	try {
+		Metadata metadata;
+		read(cdr, metadata, key_mode::not_key);
+		return metadata;
+	}
+	catch (...) { return nullopt; }
 }
 
 optional<vector<zenoh::Subscriber<void>>> handle_command_sub(const string_view &line, const zenoh::Session &session, zenoh::ZResult *zerr = nullptr) {
@@ -293,26 +333,24 @@ optional<vector<zenoh::Subscriber<void>>> handle_command_sub(const string_view &
 					return;
 				}
 
-				// Read & verify the metadata itself
-				auto buf = attachment->get().as_vector(); // Copied here; fine
-				if (flatbuffers::Verifier v{ buf.data(), buf.size() }; !VerifyChatMessageMetadataBuffer(v)) {
+				// Use the metadata to verify the payload
+				const auto metadata_opt = decode_metadata(attachment->get());
+				if (!metadata_opt.has_value()) {
 					insert_error(ostringstream{} << "Corrupted payload received from " << key << ": bad metadata.");
 					return;
 				}
-
-				// Use the metadata to verify the payload
-				const auto *metadata = GetChatMessageMetadata(buf.data());
+				const auto &metadata = metadata_opt.value();
 				const auto &payload = sample.get_payload();
-				const uint64_t content_size = metadata->content_size();
+				const uint64_t content_size = metadata.content_size();
 				if (payload.size() != content_size) {
 					insert_error(ostringstream{} << "Corrupted payload received from " << key << ": broken payload.");
 					return;
 				}
 
 				// Use payload in a zero-copy manner, according to its MIME type
-				const string_view mime_type = metadata->mime_type()->string_view();
+				const string_view mime_type = metadata.mime_type();
 				if (mime_type.find("text/") == string_view::npos) { // Not text
-					const string_view file_name = metadata->file_name()->string_view();
+					const string_view file_name = metadata.file_name();
 					{
 						lock_guard _{ current_input_mutex };
 						cout << ANSI_CLEAR_LINE;
@@ -324,8 +362,8 @@ optional<vector<zenoh::Subscriber<void>>> handle_command_sub(const string_view &
 					filesystem::path save_path = get_default_save_dir() / file_name;
 					ofstream f{ save_path, std::ios::binary };
 					auto i = payload.slice_iter();
-					for (auto it = i.next(); it.has_value(); it = i.next()) {
-						const auto slice = it.value();
+					for (auto s = i.next(); s.has_value(); s = i.next()) {
+						const auto slice = s.value();
 						f.write(reinterpret_cast<const char*>(slice.data), slice.len);
 					}
 					f.close();
@@ -336,8 +374,8 @@ optional<vector<zenoh::Subscriber<void>>> handle_command_sub(const string_view &
 					cout << ANSI_CLEAR_LINE;
 					cout << ANSI_STYLE_REGULAR_BG_SKY << '[' << key << ']' << ANSI_STYLE_REGULAR_GRAY << " >> " << ANSI_STYLE_RESET;
 					auto i = payload.slice_iter();
-					for (auto it = i.next(); it.has_value(); it = i.next()) {
-						const auto slice = it.value();
+					for (auto s = i.next(); s.has_value(); s = i.next()) {
+						const auto slice = s.value();
 						cout << string_view{ reinterpret_cast<const char*>(slice.data), slice.len };
 					}
 					cout << '\n';
@@ -400,7 +438,7 @@ optional<size_t> handle_command_send_file(const string_view &line, const zenoh::
 	path = line.substr(begin, end - begin + 1); // UTF-8
 #endif
 	auto put_opt = zenoh::Publisher::PutOptions::create_default();
-	put_opt.attachment = build_chat_message_metadata("application/octet-stream", content_size, path.filename().string());
+	put_opt.attachment = build_metadata("application/octet-stream", content_size, path.filename().string());
 	put_opt.encoding = zenoh::Encoding::Predefined::application_octet_stream();
 	const char *ptr = rm.data(); //NOTE: Must store in variable to enforce execution order!
 	publisher.put(
@@ -565,7 +603,7 @@ int main(int argc, char *argv[]) {
 				if (line[0] != '/') {
 					const string_view content{ line };
 					auto put_opt = zenoh::Publisher::PutOptions::create_default();
-					put_opt.attachment = build_chat_message_metadata("text/plain", content.size());
+					put_opt.attachment = build_metadata("text/plain", content.size());
 					put_opt.encoding = zenoh::Encoding::Predefined::text_plain();
 					do {
 						zenoh::Bytes::Writer payload_writer{};
@@ -587,7 +625,7 @@ int main(int argc, char *argv[]) {
 					case Command::ESCAPE: {
 						const string_view content = string_view{ line }.substr(1);
 						auto put_opt = zenoh::Publisher::PutOptions::create_default();
-						put_opt.attachment = build_chat_message_metadata("text/plain", content.size());
+						put_opt.attachment = build_metadata("text/plain", content.size());
 						put_opt.encoding = zenoh::Encoding::Predefined::text_plain();
 						do {
 							zenoh::Bytes::Writer payload_writer{};

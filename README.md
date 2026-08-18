@@ -6,8 +6,8 @@
 
 - 语言：C++17
 - 构建系统：CMake
-- 消息中间件：[Zenoh-Cpp](https://github.com/eclipse-zenoh/zenoh-cpp)
-- 元数据封装：[FlatBuffers](https://github.com/google/flatbuffers)
+- 消息中间件：[Eclipse Zenoh](https://github.com/eclipse-zenoh/zenoh-cpp)
+- 元数据封装：[Eclipse Cyclone DDS](https://cyclonedds.io)
 - 内存映射：[Mio](https://github.com/vimpunk/mio)
 - 命令行界面：手写
 
@@ -18,18 +18,65 @@
 1. 下载 [Ninja](https://github.com/ninja-build/ninja/releases/latest) 并放置在/添加到 Path
 2. 下载 [FlatBuffers 编译器 (flatc)](https://github.com/google/flatbuffers/releases) 并解压放置在/添加到 Path
     > 不建议使用 Linux 包管理器（APT 等）安装，因为其版本可能相当陈旧；Linux 下，若因 LIBC 版本等问题不便使用官方发布版时，建议从源码编译安装。
-3. [安装 Rust](https://rust-lang.org/zh-CN/tools/install/) 或更新至 1.75.0：`rustup update`，安装后需要打开一个新 shell（或重启当前 IDE）
+3. 从源码构建 CycloneDDS：
+    1. 克隆仓库：`git clone https://github.com/eclipse-cyclonedds/cyclonedds.git` 并 cd 到 `cyclonedds` 目录下
+    2. 按操作系统：
+        - Windows（CMD）：将下面的 BUILD_TYPE 赋值为需要使用的构建类型（`Debug` 或 `Release`），然后执行：
+            ```bat
+            set GIT_TAG=e54e991f
+            set BUILD_TYPE=Release
+            set INSTALL_DIR=C:/lib/cyclonedds/%GIT_TAG%/%BUILD_TYPE%
+
+            git checkout %GIT_TAG% -- * && git clean -fd && git clean -fdX
+            (
+            echo diff --git a/src/core/CMakeLists.txt b/src/core/CMakeLists.txt
+            echo index d4d23a49..08884943 100644
+            echo --- a/src/core/CMakeLists.txt
+            echo +++ b/src/core/CMakeLists.txt
+            echo @@ -165,5 +165,6 @@ if ^(INSTALL_PDB^)
+            echo      OPTIONAL
+            echo    ^)
+            echo  endif^(^)
+            echo -
+            echo +if^(BUILD_IDLC_XTESTS^)
+            echo  add_subdirectory^(xtests^)
+            echo +endif^(^)
+            ) > fix_xtests.patch
+            git apply fix_xtests.patch
+            cmake -S . -B build -DBUILD_EXAMPLES=FALSE -DBUILD_TESTING=FALSE -DBUILD_IDLC=TRUE -DBUILD_DDSPERF=FALSE -DENABLE_SSL=FALSE -DENABLE_ICEORYX=FALSE -DENABLE_SECURITY=FALSE -DENABLE_LIFESPAN=FALSE -DENABLE_DEADLINE_MISSED=FALSE -DENABLE_TYPELIB=FALSE -DENABLE_TYPE_DISCOVERY=FALSE -DENABLE_TOPIC_DISCOVERY=FALSE -DENABLE_SOURCE_SPECIFIC_MULTICAST=FALSE -DENABLE_IPV6=FALSE -DBUILD_IDLC_XTESTS=FALSE -DENABLE_QOS_PROVIDER=FALSE -DCMAKE_BUILD_TYPE=%BUILD_TYPE% -DCMAKE_INSTALL_PREFIX="%INSTALL_DIR%"
+            cmake --build build --config %BUILD_TYPE% && cmake --install build --config %BUILD_TYPE%
+            ```
+        - Linux：Bash 脚本待编写 <!-- TODO -->
+4. 从源码构建 CycloneDDS C++ Bindings：
+    1. 克隆仓库：`git clone https://github.com/eclipse-cyclonedds/cyclonedds-cxx.git` 并 cd 到 `cyclonedds-cxx` 目录下
+    2. 按操作系统：
+        - Windows（CMD）：将下面的 BUILD_TYPE 赋值为需要使用的构建类型（`Debug` 或 `Release`），然后执行：
+            ```bat
+            set GIT_TAG=20ccaa51
+            set BUILD_TYPE=Release
+            set INSTALL_DIR=C:/lib/cyclonedds-cxx/%GIT_TAG%/%BUILD_TYPE%
+
+            set DDS_GIT_TAG=e54e991f
+            set DDS_DIR=C:/lib/cyclonedds/%DDS_GIT_TAG%/%BUILD_TYPE%
+
+            git checkout %GIT_TAG% && git clean -fdX
+            cmake -S . -B build -DCMAKE_PREFIX_PATH="%DDS_DIR%" -DCMAKE_BUILD_TYPE=%BUILD_TYPE% -DCMAKE_INSTALL_PREFIX="%INSTALL_DIR%"
+            cmake --build build --config %BUILD_TYPE% && cmake --install build --config %BUILD_TYPE%
+            ```
+        - Linux：Bash 脚本待编写 <!-- TODO -->
+5. [安装 Rust](https://rust-lang.org/zh-CN/tools/install/) 或更新至 1.75.0：`rustup update`，安装后需要打开一个新 shell（或重启当前 IDE）
 
 构建：
 
 1. 按以下参数进行 cmake 配置（可能需要在 IDE 的 CMake 设置中修改）：
     - `-G Ninja`：Ninja 生成器可提高混合语言工程的构建速度
     - `CMAKE_BUILD_TYPE`：根据需要设置为 `Release` 或 `Debug`
+    - `CMAKE_PREFIX_PATH`：须设置/增加上文构建的 CycloneDDS 库的 *2 个* 安装目录（用 `;` 分隔，若带空格须加引号）
     - `CMAKE_INSTALL_PREFIX`：无需设置，将固定为 cmake 构建目录的 `installed/`
     - `ZENOHC_BUILD_WITH_SHARED_MEMORY` 开关（默认关闭）：若要进行本机进程间通讯，则打开
     - `ZENOHC_BUILD_WITH_UNSTABLE_API` 开关（默认关闭）：若要使用实验性 API，则打开
     - `BUILD_SHARED_LIBS` 开关（默认打开）：若要静态链接，则关闭
-    > 配置例（Windows）：`cmake -S . -B cmake-build-release -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=FALSE`
+    > 配置例（Windows）：`cmake -S . -B cmake-build-release -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=FALSE -DCMAKE_PREFIX_PATH="C:/lib/cyclonedds/e54e991f/Release;C:/lib/cyclonedds-cxx/20ccaa51/Release"`
 2. 构建工程：`cmake --build 构建目录 --target LearnZenohCpp`
 3. （可选）install，将复制各类依赖文件到构建目录的 `installed/` 下：`cmake --build 构建目录 --target install`
 
