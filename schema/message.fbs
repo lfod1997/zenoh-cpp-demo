@@ -1,9 +1,0 @@
-namespace ZenohCppDemo.Schema;
-
-table ChatMessageMetadata {
-	mime_type: string (required);
-	content_size: uint64;
-	file_name: string;
-}
-
-root_type ChatMessageMetadata;
