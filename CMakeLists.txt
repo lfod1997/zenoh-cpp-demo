@@ -120,9 +120,9 @@ target_compile_definitions(chat PRIVATE $<$<CONFIG:Debug>:DEBUG>)
 # ============================
 # Post Build and Installation
 # ============================
+set(_target chat)
 if (BUILD_SHARED_LIBS)
     # Copy shared libraries after building
-    set(_target chat)
     add_custom_command(
         TARGET ${_target}
         POST_BUILD
